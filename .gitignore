@@ -35,3 +35,6 @@ Thumbs.db
 
 # Virtualenv
 .venv/
+
+# n8n is in its own repo — never track it here
+heylisa-n8n/
