@@ -1,19 +1,29 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 
 
 class Settings(BaseSettings):
-    # ✅ Variables attendues
-    environment: str = "dev"
-    log_level: str = "INFO"
-    database_url: str  # requis
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # ✅ Lit .env à la racine du repo
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",  # ignore les variables qui traînent
-        case_sensitive=False,
-    )
+    # Core
+    environment: str = Field(default="dev", alias="ENVIRONMENT")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    # Database
+    database_url: str = Field(alias="DATABASE_URL")
+
+    # Supabase auth (optional in dev, required in prod later)
+    supabase_url: str | None = Field(default=None, alias="SUPABASE_URL")
+    supabase_anon_key: str | None = Field(default=None, alias="SUPABASE_ANON_KEY")
+
+    # LLM
+    deepseek_api_key: str | None = Field(default=None, alias="DEEPSEEK_API_KEY")
+    deepseek_model: str = Field(default="deepseek-chat", alias="DEEPSEEK_MODEL")
+    deepseek_base_url: str = Field(default="https://api.deepseek.com", alias="DEEPSEEK_BASE_URL")
+
+    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
+    openai_model_fallback: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL_FALLBACK")
+    openai_base_url: str = Field(default="https://api.openai.com", alias="OPENAI_BASE_URL")
 
 
 settings = Settings()
