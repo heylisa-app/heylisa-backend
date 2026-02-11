@@ -4,8 +4,11 @@ from asyncpg import Connection
 from app.llm.runtime import LLMRuntime
 from app.agents.orchestrator import OrchestratorAgent
 from app.services.plan_executor import PlanExecutor
+from app.services.context_loader import load_context_light
 
 from app.core.chat_logger import chat_logger
+from app.integrations.n8n_userfacts import fire_userfact_webhook
+from app.services.message_flags import extract_and_clean_message_flags
 
 
 class ChatError(Exception):
@@ -113,7 +116,28 @@ async def handle_chat_message(
         user_message_id=str(user_message_id),
     )
 
-    orch = await orchestrator.run(user_message=msg["content"])
+    # 4bis) Load context (light) for orchestrator
+    ctx = await load_context_light(
+        conn,
+        public_user_id=str(public_user_id),
+        conversation_id=str(conversation_id),
+    )
+
+    chat_logger.info(
+        "chat.ctx.loaded",
+        conversation_id=str(conversation_id),
+        user_message_id=str(user_message_id),
+        has_user=bool((ctx or {}).get("user")),
+        locale=((ctx or {}).get("settings") or {}).get("locale_main"),
+        timezone=((ctx or {}).get("settings") or {}).get("timezone"),
+        free_quota_used=((ctx or {}).get("settings") or {}).get("free_quota_used"),
+        free_quota_limit=((ctx or {}).get("settings") or {}).get("free_quota_limit"),
+        intro_smalltalk_turns=((ctx or {}).get("settings") or {}).get("intro_smalltalk_turns"),
+        intro_smalltalk_done=((ctx or {}).get("settings") or {}).get("intro_smalltalk_done"),
+        last_messages_count=len((ctx or {}).get("messages") or []),
+    )
+
+    orch = await orchestrator.run(user_message=msg["content"], ctx=ctx)
 
     plan_nodes = []
     try:
@@ -151,12 +175,19 @@ async def handle_chat_message(
     )
     try:
         exec_out = await executor.run(plan=orch.plan)
-        reply_text = exec_out["answer"]
+        reply_text_raw = exec_out["answer"]
+
+        # ✅ Nettoyage des flags de fin de message (aha_moment / onboarding_abort)
+        reply_text, flags = extract_and_clean_message_flags(reply_text_raw)
+
         provider = {
             "primary": "orchestrated",
             "fallback_used": (orch.ok is False),
             "orchestrator": {"provider": (orch.debug or {}).get("meta", {}).get("provider")},
         }
+
+        # ✅ Ajoute les flags au provider/meta (pour debug et analytics)
+        provider["flags"] = flags.to_metadata()
         chat_logger.info(
             "chat.executor.done",
             conversation_id=str(conversation_id),
@@ -169,7 +200,7 @@ async def handle_chat_message(
     except Exception as e:
         # filet de sécurité ultime
         reply_text = "Désolé — j’ai eu un souci technique. Réessaie dans quelques secondes."
-        provider = {"primary": "error_fallback", "fallback_used": True, "error": str(e)[:160]}
+        provider = {"primary": "error_fallback", "fallback_used": True, "error": str(e)[:160], "flags": {"aha_moment": False, "onboarding_abort": False}}
 
         chat_logger.error(
             "chat.executor.error",
@@ -197,11 +228,36 @@ async def handle_chat_message(
         conversation_id,
         public_user_id,
         reply_text,
-        json.dumps({"event_type": "backend_chat", "provider": provider}),
+        json.dumps({"event_type": "backend_chat", "provider": provider}, default=str),
         dedupe_key,
     )
 
     assistant_message_id = str(inserted["id"])
+
+    # ✅ Post-actions (AHA moment / abort) — best effort, ne casse pas le chat
+    try:
+        if provider.get("flags", {}).get("aha_moment") is True:
+            await conn.execute(
+                """
+                update public.user_settings
+                set discovery_status = 'complete',
+                    discovery_completed_at = now()
+                where user_id = $1
+                """,
+                public_user_id,
+            )
+        elif provider.get("flags", {}).get("onboarding_abort") is True:
+            await conn.execute(
+                """
+                update public.user_settings
+                set discovery_status = 'aborted'
+                where user_id = $1
+                and coalesce(discovery_status,'pending') <> 'complete'
+                """,
+                public_user_id,
+            )
+    except Exception as _e:
+        chat_logger.info("chat.flags.persist_error", error=str(_e)[:180])
 
     chat_logger.info(
         "chat.persisted",
@@ -209,6 +265,31 @@ async def handle_chat_message(
         user_message_id=str(user_message_id),
         assistant_message_id=str(assistant_message_id),
     )
+
+    # 6bis) Fire-and-forget user facts catcher (must not impact chat latency)
+    chat_logger.info("userfacts.hook.before", conversation_id=str(conversation_id), user_message_id=str(user_message_id))
+
+    try:
+        payload = {
+            "public_user_id": str(public_user_id),
+            "conversation_id": str(conversation_id),
+            "user_message_id": str(user_message_id),
+            "assistant_message_id": str(assistant_message_id),
+            "user_text": (msg["content"] or ""),
+            "locale": ((ctx or {}).get("settings") or {}).get("locale_main"),
+            "timezone": ((ctx or {}).get("settings") or {}).get("timezone"),
+        }
+
+        chat_logger.info("userfacts.hook.payload_ready", public_user_id=str(public_user_id))
+
+        # ✅ IMPORTANT : si fire_userfact_webhook est async -> create_task
+        import asyncio
+        asyncio.create_task(fire_userfact_webhook(payload))
+
+        chat_logger.info("userfacts.hook.task_scheduled")
+
+    except Exception as e:
+        chat_logger.info("userfacts.webhook.call_error", error=str(e)[:180])
 
     # 7) Update user msg metadata with assistant id (idempotence marker)
     # We merge existing metadata (best effort)

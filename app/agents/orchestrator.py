@@ -15,7 +15,8 @@ from app.agents.node_registry import (
 
 
 IntentType = Literal[
-    "onboarding",
+    "smalltalk_intro",
+    "discovery",
     "small_talk",
     "amabilities",
     "functional_question",
@@ -30,6 +31,8 @@ IntentType = Literal[
 ]
 
 ContextLevel = Literal["light", "medium", "max"]
+MANDATORY_DISCOVERY_SCOPE = "discovery.value_proposition"
+DOCS_SCOPES_MAX = 5
 
 # NOTE: v1 — plan minimal : P1 parallel [context + quota] puis response_writer
 @dataclass
@@ -64,10 +67,37 @@ Quota freemium : 8 messages gratuits (lifetime). Au-delà : paywall.
 ═══════════════════════════════════════════════════════════════
 INTENTS (classification exhaustive)
 
-onboarding
-→ Découverte de Lisa
-→ Signaux : Moins de 20 messages échangés
+smalltalk_intro
+→ Small talk de connexion “strict” pour collecter les facts minimum (tu/vous, prénom, ville, activité)
+→ Actif seulement si quota OK ET facts minimum incomplets
+→ Au niveau orchestrator : tu actives le mode via inputs vers response_writer
 → level=light
+
+RÈGLE SMALLTALK_INTRO (DÉTERMINISTE):
+Si ctx.user_status.is_pro = false
+ET ctx.user_status.state != "blocked"
+ET ctx.user_status.free_quota_used < ctx.user_status.free_quota_limit
+ET ctx.user_facts.missing_required_count > 0
+ALORS intent = smalltalk_intro
+SAUF si le dernier message utilisateur est manifestement hors phase d'intro
+(ex: question produit, demande urgente, sujet sensible, etc.).
+
+discovery
+→ Phase de découverte guidée (présentation + cadrage).
+→ Source de vérité: ctx.gates.discovery_forced et ctx.gates.discovery_status.
+→ intent=discovery si ctx.gates.discovery_forced=true ET ctx.gates.discovery_status != "complete".
+→ level=light
+
+RÈGLES DOCUMENTATION (Discovery):
+- scope_need = true
+- Tu DOIS sélectionner 1 à 3 scopes maximum dans la liste "DOCUMENTATION DISPONIBLE (SCOPES EXACTS)"
+- scopes_selected doit être une liste de strings
+- Si aucun scope n'est pertinent, alors scope_need=false et scopes_selected=[]
+
+RÈGLE PRIORITAIRE (DÉTERMINISTE):
+Si ctx.gates.discovery_forced = true ET ctx.gates.discovery_status != "complete"
+ALORS intent = discovery (peu importe le message utilisateur)
+SAUF si intent doit être urgent_request ou sensitive_question.
 
 small_talk
 → Conversation légère, prise de nouvelles, glaner facts clés (tutoiement, ville, activité, etc.)
@@ -107,8 +137,8 @@ action_request
 → Si mode Personal : déclinaison + upsell Ultimate
 
 deep_work
-→ Travail approfondi (analyse doc, synthèse, rédaction, recherche complexe)
-→ Signaux : "Analyse ce document", "Synthèse de X", "Recherche tout sur Y"
+→ Travail approfondi (analyse doc, synthèse, développement (code), rédaction, recherche complexe)
+→ Signaux : "Analyse ce document", "Synthèse de X", "Recherche tout sur Y", "travail logiciel"
 → level=medium (ou max si lié projets user)
 
 professional_request
@@ -130,7 +160,7 @@ urgent_request
 Priorité si ambiguïté :
 urgent_request > sensitive_question > professional_request > decision_support > 
 action_request > functional_question > general_question > motivational_guidance > 
-onboarding > small_talk > amabilities
+discovery > small_talk > amabilities
 
 ═══════════════════════════════════════════════════════════════
 WEB SEARCH (need_web)
@@ -158,7 +188,7 @@ Sinon web_search_prompt=null.
 {render_ids_rules_block()}
 
 TON JOB
-Analyser message user → Produire plan DAG optimal.
+Analyser message user dans son contexte (tenir compte des échanges précédents) → Produire plan DAG optimal pour répondre au dernier message user.
 
 LANGUE
 - language = fr, en, es, de, it, pt, other
@@ -169,14 +199,18 @@ SORTIE: voir schéma.
 
 
 JSON_SCHEMA_HINT = {
-    "ok": True,
-    "language": "fr",
-    "intent": "general_question",
-    "context_level": "medium",
-    "need_web": False,
-    "web_search_prompt": None,
-    "confidence": 0.92,
-    "plan": {
+  "ok": True,
+  "language": "fr",
+  "intent": "general_question",
+  "context_level": "medium",
+  "need_web": False,
+  "web_search_prompt": None,
+  "confidence": 0.92,
+
+  "scope_need": False,
+  "scopes_selected": [],
+
+  "plan":  {
         "nodes": [
             {
                 "id": "A",
@@ -193,7 +227,6 @@ JSON_SCHEMA_HINT = {
                     "intent": "general_question",
                     "language": "fr",
                     "tone": "warm",
-                    "include_smalltalk": False,
                     "need_web": False,
                 },
             },
@@ -209,6 +242,56 @@ def _safe_json(text: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+def _language_from_ctx(ctx: Optional[Dict[str, Any]]) -> str:
+    """
+    Source of truth: ctx.settings.locale_main
+    Retourne une langue courte (fr, en, it, es, de, pt)
+    """
+    try:
+        locale = (ctx or {}).get("settings", {}).get("locale_main")
+        if isinstance(locale, str) and locale:
+            return locale.split("-")[0].lower()
+    except Exception:
+        pass
+    return "fr"
+
+def _render_docs_scopes_block(ctx: Optional[Dict[str, Any]]) -> str:
+    """
+    Injecte la liste des docs scopes dans le SYSTEM PROMPT.
+    Source de vérité: ctx.docs.scopes_all
+    """
+    scopes = []
+    try:
+        docs = (ctx or {}).get("docs") or {}
+        scopes = docs.get("scopes_all") or []
+    except Exception:
+        scopes = []
+
+    # nettoyage + limite soft
+    clean: List[str] = []
+    for s in (scopes or [])[:200]:
+        if isinstance(s, str):
+            ss = s.strip()
+            if ss:
+                clean.append(ss)
+
+    if not clean:
+        return (
+            "\n═══════════════════════════════════════════════════════════════\n"
+            "DOCUMENTATION DISPONIBLE (SCOPES)\n"
+            "AUCUN SCOPE DISPONIBLE.\n"
+            "Tu ne dois pas inventer de scopes.\n"
+        )
+
+    lines = "\n".join(f"- {s}" for s in clean)
+
+    return (
+        "\n═══════════════════════════════════════════════════════════════\n"
+        "DOCUMENTATION DISPONIBLE (SCOPES EXACTS)\n"
+        "Tu ne peux sélectionner QUE des scopes présents dans cette liste. Tu n'en inventes jamais.\n"
+        "Liste:\n"
+        f"{lines}\n"
+    )
 
 def _fallback_plan_minimal(language: str = "fr") -> Dict[str, Any]:
     """
@@ -232,12 +315,261 @@ def _fallback_plan_minimal(language: str = "fr") -> Dict[str, Any]:
                     "intent": "general_question",
                     "language": language,
                     "tone": "warm",
-                    "include_smalltalk": False,
                     "need_web": False,
                 },
             },
         ]
     }
+
+def _is_short_ack(text: str) -> bool:
+    """
+    Heuristique ultra simple pour identifier un "ack" (ok/merci/go...).
+    Sert uniquement à éviter de sortir du smalltalk_intro sur un message vide/accusé.
+    Ce n'est PAS un mécanisme de forçage d'intent.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+
+    # réponses ultra courtes
+    if len(t) <= 3:
+        return True
+
+    # petites confirmations fréquentes (FR/EN)
+    return t in {
+        "ok", "okay", "oui", "non", "d'accord", "dac", "ça marche", "c'est bon",
+        "nickel", "parfait", "merci", "super", "top", "go", "vas-y", "yes", "no", "thanks",
+    }
+
+def _ensure_mandatory_scope(scopes: List[str], mandatory: str, max_len: int) -> List[str]:
+    clean: List[str] = []
+    for s in (scopes or []):
+        if isinstance(s, str):
+            ss = s.strip()
+            if ss:
+                clean.append(ss)
+
+    # dédoublonnage en gardant l'ordre
+    seen = set()
+    dedup = []
+    for s in clean:
+        if s not in seen:
+            dedup.append(s)
+            seen.add(s)
+
+    if mandatory not in seen:
+        dedup = [mandatory] + dedup
+
+    return dedup[:max_len]
+
+def _compute_smalltalk_intro_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    gates = (ctx or {}).get("gates") or {}
+    eligible = bool(gates.get("smalltalk_intro_eligible"))
+    target = gates.get("smalltalk_target_key")
+    missing = gates.get("missing_required") or []
+    return {
+        "smalltalk_intro_eligible": eligible,
+        "smalltalk_target_key": target,
+        "missing_required": missing,
+    }
+
+def _compute_discovery_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    gates = (ctx or {}).get("gates") or {}
+    return {
+        "discovery_forced": bool(gates.get("discovery_forced")),
+        "discovery_status": gates.get("discovery_status"),
+        "transition_window": bool(gates.get("transition_window")),
+        "transition_reason": gates.get("transition_reason"),
+    }
+
+
+def _compute_capabilities(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    caps = (ctx or {}).get("capabilities") or {}
+    # fallback si pas présent
+    return {
+        "has_paid_agent": bool(caps.get("has_paid_agent", False)),
+        "can_action_request": bool(caps.get("can_action_request", False)),
+        "can_deep_work": bool(caps.get("can_deep_work", False)),
+        "can_professional_request": bool(caps.get("can_professional_request", False)),
+    }
+
+
+def _apply_business_gates(
+    *,
+    llm_intent: str,
+    user_message: str,
+    ctx: Dict[str, Any],
+    confidence: float,
+) -> Dict[str, Any]:
+    """
+    Retourne:
+      - intent_final
+      - mode: "smalltalk_intro" | "normal"
+      - intent_eligible bool
+      - intent_block_reason str|None
+      - gates/capabilities pass-through
+    """
+    gate = _compute_smalltalk_intro_gate(ctx)
+    caps = _compute_capabilities(ctx)
+    discvr = _compute_discovery_gate(ctx)
+    discovery_forced = bool(discvr.get("discovery_forced"))
+
+    eligible_intro = bool(gate["smalltalk_intro_eligible"])
+    short_ack = _is_short_ack(user_message)
+
+    # 1) Overrides qui cassent l'intro (si explicitement détectés)
+    hard_overrides = {"urgent_request", "sensitive_question"}
+    soft_overrides = {
+        "functional_question",
+        "general_question",
+        "decision_support",
+        "motivational_guidance",
+        "professional_request",
+        "action_request",
+        "deep_work",
+    }
+
+    intent = (llm_intent or "general_question").strip()
+
+    # 1) smalltalk_intro gate (prioritaire)
+    if eligible_intro:
+        if intent in hard_overrides:
+            mode = "normal"
+            intent_final = intent
+        elif intent in soft_overrides and confidence >= 0.85 and not short_ack:
+            mode = "normal"
+            intent_final = intent
+        else:
+            mode = "smalltalk_intro"
+            intent_final = "smalltalk_intro"
+    else:
+        mode = "normal"
+        intent_final = intent
+
+    # 2) Forced discovery (si discovery_forced et discovery pas complete)
+    #    Sauf urgences / sensible
+    if discovery_forced and intent_final not in {"urgent_request", "sensitive_question"}:
+        mode = "discovery"
+        intent_final = "discovery"
+
+    # 3) Pendant intro: absorb amabilities/small_talk
+    if mode == "smalltalk_intro" and intent_final in {"amabilities", "small_talk"}:
+        intent_final = "smalltalk_intro"
+
+    # 4) Pendant discovery: absorb amabilities/small_talk aussi
+    if mode == "discovery" and intent_final in {"amabilities", "small_talk"}:
+        intent_final = "discovery"
+
+    # 4bis) Capabilities gating
+    intent_eligible = True
+    block_reason = None
+    if intent_final in {"action_request", "deep_work", "professional_request"}:
+        # tu as dit: dispo seulement si agent payant actif au-delà de personal_assistant
+        if not caps.get("has_paid_agent"):
+            intent_eligible = False
+            block_reason = "AGENT_NOT_ACTIVE"
+
+    return {
+        "intent_final": intent_final,
+        "mode": mode,
+        "intent_eligible": intent_eligible,
+        "intent_block_reason": block_reason,
+        "discovery": discvr,
+        "gates": gate,
+        "capabilities": caps,
+        "signals": {"short_ack": short_ack},
+    }
+
+
+def _build_plan_minimal(
+    *,
+    language: str,
+    intent: str,
+    mode: str,
+    need_web: bool,
+    web_search_prompt: Optional[str],
+    context_level: str,
+    gates: Dict[str, Any],
+    intent_eligible: bool,
+    intent_block_reason: Optional[str],
+    transition_window: bool,
+    transition_reason: Optional[str],
+
+    scope_need: bool,
+    scopes_selected: List[str],
+) -> Dict[str, Any]:
+    """
+    Plan stable, peu risqué.
+    """
+    nodes = [
+        {
+            "id": "A",
+            "type": "tool.db_load_context",
+            "parallel_group": "P1",
+            "inputs": {"level": context_level or "medium"},
+        },
+    ]
+
+    # amabilities en mode normal => pas de quota_check
+    if not (mode == "normal" and intent == "amabilities"):
+        nodes.append({"id": "B", "type": "tool.quota_check", "parallel_group": "P1"})
+
+    if need_web:
+        nodes.append(
+            {
+                "id": "C",
+                "type": "tool.web_search",
+                "depends_on": ["A"] if not any(n["id"] == "B" for n in nodes) else ["A", "B"],
+                "inputs": {"prompt": web_search_prompt, "language": language},
+            }
+        )
+
+    # --- Documentation chunks (scopes) ---
+    if scope_need:
+        nodes.append(
+            {
+                "id": "S",
+                "type": "tool.docs_chunks",
+                "depends_on": ["A"],
+                "inputs": {
+                    "scopes": scopes_selected[:DOCS_SCOPES_MAX],  # hard cap sécurité
+                },
+            }
+        )
+
+    deps = ["A"]
+
+    if any(n["id"] == "B" for n in nodes):
+        deps.append("B")
+
+    if need_web:
+        deps.append("C")
+
+    if scope_need:
+        deps.append("S")
+
+    nodes.append(
+        {
+            "id": "D",
+            "type": "agent.response_writer",
+            "depends_on": deps,
+            "inputs": {
+                "intent": intent,
+                "mode": mode,
+                "language": language,
+                "tone": "warm",
+                "need_web": need_web,
+                "smalltalk_target_key": (gates or {}).get("smalltalk_target_key"),
+                "intent_eligible": intent_eligible,
+                "intent_block_reason": intent_block_reason,
+
+                "transition_window": bool(transition_window),
+                "transition_reason": transition_reason,
+            },
+        }
+    )
+
+    return {"nodes": nodes}
 
 def _sanitize_plan_or_fallback(
     *,
@@ -246,6 +578,8 @@ def _sanitize_plan_or_fallback(
     intent: str,
     need_web: bool,
     web_search_prompt: Optional[str],
+    scope_need: bool,
+    scopes_selected: List[str],
     debug: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
@@ -300,6 +634,14 @@ def _sanitize_plan_or_fallback(
         if not any(n.get("type") == "tool.web_search" for n in nodes):
             return _fallback("need_web_but_web_node_missing")
 
+    # 4bis) scope_need => node tool.docs_chunks obligatoire + scopes_selected non vide
+    if scope_need:
+        if not isinstance(scopes_selected, list) or len(scopes_selected) == 0:
+            return _fallback("scope_need_but_scopes_missing")
+
+        if not any(n.get("type") == "tool.docs_chunks" for n in nodes):
+            return _fallback("scope_need_but_docs_node_missing")
+
     # 5) amabilities => pas de quota_check dans le plan
     if intent == "amabilities":
         if any(n.get("type") == "tool.quota_check" for n in nodes):
@@ -325,32 +667,34 @@ class OrchestratorAgent:
     def __init__(self, llm: LLMRuntime):
         self.llm = llm
 
-    async def run(self, *, user_message: str) -> OrchestratorResult:
+    async def run(self, *, user_message: str, ctx: Optional[Dict[str, Any]] = None) -> OrchestratorResult:
+        ctx_json = json.dumps(ctx or {}, ensure_ascii=False, default=str)
+
         user_prompt = f"""Message utilisateur:
-{user_message}
+    {user_message}
 
-RÈGLE CRITIQUE:
-- Ta décision DOIT dépendre du message user.
-- Interdit de répéter toujours le même intent.
+    CONTEXTE (JSON, source de vérité): 
+    {ctx_json}
 
-Exemples rapides:
-- "Bonne nuit" -> intent=amabilities
-- "Aide-moi à choisir" -> intent=decision_support
+    RÈGLES CRITIQUES:
+    - Tu DOIS utiliser le CONTEXTE pour choisir intent.
+    - transition_window et transition_reason viennent du CONTEXTE (ctx.gates). Tu ne les inventes jamais.
+    - Tu peux les recopier tels quels dans ta sortie si tu les exposes, sinon ignore-les.
 
-IMPORTANT (WEB SEARCH):
-- need_web doit suivre strictement les règles WEB SEARCH.
-- Si need_web=true => web_search_prompt non vide (3-4 lignes max).
+    SCHÉMA JSON (à suivre exactement):
+    {json.dumps(JSON_SCHEMA_HINT, ensure_ascii=False)}
+    """
 
-SCHÉMA JSON (à suivre exactement):
-{json.dumps(JSON_SCHEMA_HINT, ensure_ascii=False)}
-"""
+        docs_block = _render_docs_scopes_block(ctx)
+        system_prompt = SYSTEM_PROMPT + docs_block
 
         data, meta = await self.llm.chat_json(
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,
+            trace={"agent": "orchestrator", "phase": "intent+plan"},
         )
         
         raw_llm = data
@@ -394,7 +738,7 @@ SCHÉMA JSON (à suivre exactement):
                 debug={"error": "INVALID_JSON_FROM_LLM", "meta": meta, "raw_llm": raw_llm},
             )
 
-        language = str(data.get("language") or "fr")
+        language = _language_from_ctx(ctx)
         intent = data.get("intent") or "general_question"
         level = data.get("context_level") or "medium"
         confidence = float(data.get("confidence") or 0.0)
@@ -402,11 +746,95 @@ SCHÉMA JSON (à suivre exactement):
         need_web = bool(data.get("need_web") or False)
         web_search_prompt = data.get("web_search_prompt", None)
 
-        plan = data.get("plan")
+        scope_need = bool(data.get("scope_need") or False)
+
+        raw_scopes = data.get("scopes_selected") or []
+        scopes_selected: List[str] = []
+        if isinstance(raw_scopes, list):
+            for s in raw_scopes[:DOCS_SCOPES_MAX]:
+                if isinstance(s, str) and s.strip():
+                    scopes_selected.append(s.strip())
+
+        # Règle 1: si scope_need=false => scopes_selected=[]
+        if not scope_need:
+            scopes_selected = []
+
+        # Règle 2: si scope_need=true MAIS aucun scope valide => on désactive
+        if scope_need and len(scopes_selected) == 0:
+            scope_need = False
+
+        # --- Business gates déterministes (mode smalltalk_intro + capabilities) ---
+        gate_out = _apply_business_gates(
+            llm_intent=str(intent),
+            user_message=user_message,
+            ctx=ctx or {},
+            confidence=confidence,
+        )
+
+        intent_final = gate_out["intent_final"]
+        mode = gate_out["mode"]
+        gates = gate_out["gates"]
+
+        # --- Guardrail scopes: jamais pendant smalltalk (intro/soft/amabilities) ---
+        if mode in {"smalltalk_intro"} or intent_final in {"small_talk", "amabilities"}:
+            scope_need = False
+            scopes_selected = []
+
+        # --- Discovery: scope obligatoire "value_proposition" ---
+        if intent_final == "discovery":
+            scope_need = True
+            scopes_selected = _ensure_mandatory_scope(
+                scopes_selected,
+                MANDATORY_DISCOVERY_SCOPE,
+                DOCS_SCOPES_MAX,
+            )
+
+        # --- Transition window: source de vérité = ctx.gates (calculé côté context_loader) ---
+        ctx_gates = (ctx or {}).get("gates") or {}
+        transition_window = bool(ctx_gates.get("transition_window"))
+        transition_reason = ctx_gates.get("transition_reason")
+
+        if transition_reason is not None:
+            transition_reason = str(transition_reason)[:80]
+
+        intent_eligible = gate_out["intent_eligible"]
+        intent_block_reason = gate_out["intent_block_reason"]
+        capabilities = gate_out["capabilities"]
+        signals = gate_out["signals"]
+
+        # --- Plan stable (on ignore le "plan" du LLM, trop risqué) ---
+        plan = _build_plan_minimal(
+            language=language or "fr",
+            intent=intent_final,
+            mode=mode,
+            need_web=need_web,
+            web_search_prompt=web_search_prompt if need_web else None,
+            context_level=level or "medium",
+            gates=gates,
+            intent_eligible=intent_eligible,
+            intent_block_reason=intent_block_reason,
+            transition_window=transition_window,
+            transition_reason=transition_reason,
+
+            scope_need=scope_need,
+            scopes_selected=scopes_selected,
+        )
+
         debug = data.get("debug") or {}
 
         debug["meta"] = meta
         debug["raw_llm"] = raw_llm
+
+        debug["gates"] = gates
+        debug["capabilities"] = capabilities
+        debug["signals"] = signals
+        debug["mode"] = mode
+        debug["intent_final"] = intent_final
+        debug["intent_eligible"] = intent_eligible
+        debug["intent_block_reason"] = intent_block_reason
+        debug["scope_need"] = scope_need
+        debug["scopes_selected"] = scopes_selected
+        debug["docs_scopes_count"] = int(((ctx or {}).get("docs") or {}).get("scopes_count") or 0)
 
         # --- Guardrails MINIMAUX (pas de correction d'intent) ---
 
@@ -434,7 +862,7 @@ SCHÉMA JSON (à suivre exactement):
             debug["web_prompt_missing"] = True
 
         # 3) amabilities => contraintes hard
-        if intent == "amabilities":
+        if intent_final == "amabilities":
             level = "light"
             need_web = False
             web_search_prompt = None
@@ -443,9 +871,11 @@ SCHÉMA JSON (à suivre exactement):
         plan = _sanitize_plan_or_fallback(
             plan=plan,
             language=language or "fr",
-            intent=intent,
+            intent=intent_final,
             need_web=need_web,
             web_search_prompt=web_search_prompt,
+            scope_need=scope_need,
+            scopes_selected=scopes_selected,
             debug=debug,
         )
 
@@ -466,7 +896,7 @@ SCHÉMA JSON (à suivre exactement):
         return OrchestratorResult(
             ok=True,
             language=language or "fr",
-            intent=intent,
+            intent=intent_final,
             context_level=level,
             need_web=need_web,
             web_search_prompt=web_search_prompt if need_web else None,

@@ -1,16 +1,19 @@
 import structlog
 import logging
 import sys
+import os
 
 
 def setup_logging():
     """Configure structlog pour logs JSON structurés"""
 
-    # Logging stdlib (base obligatoire)
+    level_name = (os.getenv("LOG_LEVEL") or "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,
-        level=logging.INFO,
+        level=level,
     )
 
     structlog.configure(

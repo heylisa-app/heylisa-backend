@@ -7,6 +7,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+import json
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -63,6 +64,21 @@ class LLMRuntime:
         self.timeout_s = float(_env("LLM_TIMEOUT_S", "20"))
         self.max_retries = int(_env("LLM_MAX_RETRIES", "0"))
 
+    def _trace_enabled(self) -> bool:
+        return str(_env("LLM_TRACE", "0")).strip() in {"1", "true", "True"}
+
+    def _trace_store_enabled(self) -> bool:
+        return str(_env("LLM_TRACE_STORE", "0")).strip() in {"1", "true", "True"}
+
+    def _safe_preview(self, obj: Any, max_chars: int = 1200) -> str:
+        try:
+            s = json.dumps(obj, ensure_ascii=False, default=str)
+        except Exception:
+            s = str(obj)
+        if len(s) <= max_chars:
+            return s
+        return s[: max_chars - 3] + "..."
+
     def _headers(self, api_key: str) -> Dict[str, str]:
         return {
             "Authorization": f"Bearer {api_key}",
@@ -81,6 +97,7 @@ class LLMRuntime:
         *,
         temperature: float = 0.2,
         max_tokens: int = 800,
+        trace: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Returns (text, meta)
@@ -107,6 +124,18 @@ class LLMRuntime:
             "model": provider["model"],
             "duration_ms": payload_base.get("_meta", {}).get("duration_ms"),
         }
+        if self._trace_enabled():
+            print(
+                "[LLM_TRACE] chat_text",
+                {
+                    "provider": meta["provider"],
+                    "model": meta["model"],
+                    "duration_ms": meta["duration_ms"],
+                    "trace": trace or {},
+                    "messages_preview": self._safe_preview(messages, 800),
+                    "response_preview": (text[:500] + "…") if len(text) > 500 else text,
+                },
+            )
         return text, meta
 
     async def chat_json(
@@ -116,6 +145,7 @@ class LLMRuntime:
         json_schema: Optional[Dict[str, Any]] = None,
         temperature: float = 0.0,
         max_tokens: int = 900,
+        trace: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
         Returns (json_obj, meta)
@@ -154,6 +184,20 @@ class LLMRuntime:
             "duration_ms": payload.get("_meta", {}).get("duration_ms"),
             "schema_hint": bool(json_schema),
         }
+
+        if self._trace_enabled():
+            print(
+                "[LLM_TRACE] chat_json",
+                {
+                    "provider": meta["provider"],
+                    "model": meta["model"],
+                    "duration_ms": meta["duration_ms"],
+                    "schema_hint": meta["schema_hint"],
+                    "trace": trace or {},
+                    "messages_preview": self._safe_preview(messages, 800),
+                    "response_preview": self._safe_preview(obj, 500),
+                },
+            )
         return obj, meta
 
 
@@ -181,8 +225,29 @@ class LLMRuntime:
                 )
             except Exception as e:
                 last_err = e
-                # On tente le fallback immédiatement
+
+                if self._trace_enabled():
+                    print(
+                        "[LLM_TRACE] provider_failed",
+                        {
+                            "provider": provider["name"],
+                            "model": provider.get("model"),
+                            "error_type": type(e).__name__,
+                            "error_preview": str(e)[:200],
+                        },
+                    )
+
+                # on tente le provider suivant
                 continue
+
+        if self._trace_enabled():
+            print(
+                "[LLM_TRACE] all_providers_failed",
+                {
+                    "last_error_type": type(last_err).__name__ if last_err else None,
+                    "last_error_preview": str(last_err)[:300] if last_err else None,
+                },
+            )
 
         raise LLMCallError(f"All LLM providers failed. Last error: {last_err}")
 

@@ -3,18 +3,21 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.core.logging import setup_logging
+import structlog
+
 from app.api.routes import router
-from app.core.logging import setup_logging, logger
 from app.db.pool import init_pool, close_pool
 from app.settings import settings
 
-# Logging setup (once at import time)
+# --- Logging setup (ONCE, at import time) ---
 setup_logging()
+logger = structlog.get_logger("app.main")
+logger.info("logging_configured")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     await init_pool()
     logger.info(
         "heylisa_backend_started",
@@ -22,7 +25,6 @@ async def lifespan(app: FastAPI):
         service="heylisa-backend",
     )
     yield
-    # Shutdown
     await close_pool()
     logger.info("heylisa_backend_stopped", service="heylisa-backend")
 
@@ -33,11 +35,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Routers
 app.include_router(router)
 
 
-# Root endpoint (quick smoke test)
 @app.get("/")
 async def root():
     logger.info("root_endpoint_called")

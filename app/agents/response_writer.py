@@ -6,10 +6,13 @@ from typing import Any, Dict, Optional
 
 from app.llm.runtime import LLMRuntime
 from app.prompts.loader import load_lisa_system_prompts
+from app.prompts.user.loader import load_user_prompt_block
+from app.core.chat_logger import chat_logger
 
 from uuid import UUID
 from datetime import datetime, date
 from decimal import Decimal
+
 
 
 SYSTEM_RESPONSE_WRITER_PROMPT = """
@@ -19,72 +22,6 @@ OBJECTIF
 - Produire une réponse utile, humaine, claire, actionnable.
 - Ton = conversationnel, direct, naturel. Zéro blabla.
 
-CONTRAINTES ABSOLUES (FORMAT)
-- Pas de HTML.
-- Pas de Markdown complexe : PAS de tableaux, PAS de blocs de code.
-- Le gras autorisé : **texte** (1 à 3 éléments max). Pas de phrases entières en gras.
-- Les listes : lignes qui commencent par "- " (tiret + espace).
-- Pas de titres inventés en MAJUSCULES.
-- Ne mets jamais # ou ##.
-- Ne mets pas de "•" manuellement.
-
-CONVENTIONS DE MISE EN FORME (UI SIGNATURE LISA)
-1) Infos clés
-Si tu fais un récap important :
-🧠 Infos clés
-- ...
-- ...
-(2 à 5 puces max)
-
-2) Prochaine étape
-Si tu donnes UNE action claire :
-✅ Prochaine étape : ...
-(une seule par message)
-
-3) À retenir
-Si tu fixes un principe / une règle :
-📌 À retenir : ...
-(1 à 3 lignes max)
-
-4) Citation
-Si tu cites quelqu’un :
-> ...
-— Auteur
-
-5) Ressource (1 max par message sauf demande explicite)
-Livre
-📚 Livre : Titre — Auteur (optionnel)
-Résumé : <200 à 500 caractères. Message principal + pourquoi utile pour ce user.>
-
-YouTube
-🎬 YouTube : Titre — Chaîne (optionnel)
-Résumé : <200 à 500 caractères. Message clé + bénéfice attendu pour ce user.>
-
-Règles Ressource
-- "Résumé :" obligatoire.
-- Pas de lien URL dans le chat (sauf si user demande explicitement).
-
-ANTI-PATTERNS INTERDITS
-- Style robot : "Voici une réponse structurée..." / "En tant qu'IA..." / "Je ne peux pas..."
-- Listes interminables.
-- Reposer 5 questions à la suite.
-- Répéter le message user.
-- Promettre une action réelle (emails, réservation, etc.) si le mode n'est pas actif.
-
-RÈGLES CONTENU
-- Si intent = amabilities : réponse courte (1-2 phrases), chaleureuse, pas de question.
-- Si intent = urgent_request : ton calme, rassurant, direct. Pas de small talk.
-- Si intent = sensitive_question : prudence + limites. Réponse générale + recommandation pro si nécessaire.
-- Si intent = functional_question : expliquer clairement ce que Lisa peut faire, et ce qu'elle ne fait pas (selon mode).
-- Si intent = decision_support : clarifie options + critères + recommandation nuancée + prochaine étape unique.
-- Si intent = action_request :
-  - Si mode Personal : expliquer que tu ne peux pas exécuter, proposer alternative (plan / message / template) + upsell soft.
-  - Si mode Ultimate actif : tu peux proposer le plan d’exécution (mais PAS exécuter toi-même ici).
-- Si web_search est présent : base ta réponse d’abord dessus et cite 1 à 3 sources au maximum, sous forme de puces à la fin :
-  📌 Sources
-  - Titre — domaine
-  - Titre — domaine
-  (pas d’URL)
 """
 
 SOURCES_BLOCK_HEADER = "📌 Sources"
@@ -148,7 +85,6 @@ class ResponseWriterAgent:
       - intent: str
       - language: str
       - tone: str ("warm"|"neutral"|"calm"...)
-      - include_smalltalk: bool
       - need_web: bool
       - context: dict (from tool.db_load_context)
       - quota: dict (from tool.quota_check) optional
@@ -169,13 +105,19 @@ class ResponseWriterAgent:
         intent: str,
         language: str = "fr",
         tone: str = "warm",
-        include_smalltalk: bool = False,
         need_web: bool = False,
+        mode: str = "normal",
+        smalltalk_target_key: Optional[str] = None,
+        transition_window: bool = False,
+        transition_reason: Optional[str] = None,
+        intent_eligible: bool = True,
+        intent_block_reason: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
         quota: Optional[Dict[str, Any]] = None,
         web: Optional[Dict[str, Any]] = None,
         # compat: si un autre appel utilise encore web_search=
         web_search: Optional[Dict[str, Any]] = None,
+        docs_chunks: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         start_ts = time.time()
 
@@ -185,9 +127,13 @@ class ResponseWriterAgent:
         ws = web if isinstance(web, dict) and web else (web_search or {})
 
         # --- Extract minimal user prefs from context (optional) ---
-        user_settings = _pick(ctx, "user_settings", {}) or {}
-        use_tu_form = bool(_pick(user_settings, "use_tu_form", None))
+        settings = _pick(ctx, "settings", {}) or {}
+        use_tu_raw = _pick(settings, "use_tu_form", None)
+        use_tu_form = True if use_tu_raw is True else False if use_tu_raw is False else False
+        use_tu_known = (use_tu_raw is True) or (use_tu_raw is False)
         user_name = _pick(_pick(ctx, "user", {}), "first_name", None)
+        intro_smalltalk_turns = int(_pick(settings, "intro_smalltalk_turns", 0) or 0)
+        intro_smalltalk_done = bool(_pick(settings, "intro_smalltalk_done", False))
 
         # --- Quota info (optional) ---
         paywall_should_show = bool(_pick(q, "paywall_should_show", False))
@@ -195,6 +141,14 @@ class ResponseWriterAgent:
         quota_used = _pick(q, "used", None)
         quota_limit = _pick(q, "limit", None)
         is_pro = bool(_pick(q, "is_pro", False))
+
+        # --- Soft warning: last free message (only if non-pro) ---
+        should_soft_warn = (
+            (not is_pro)
+            and (quota_used is not None)
+            and (quota_limit is not None)
+            and (int(quota_used) == int(quota_limit) - 1)
+        )
 
         # --- Web search block (optional) ---
         ws_ok = bool(_pick(ws, "ok", False))
@@ -218,17 +172,110 @@ class ResponseWriterAgent:
                 sources_digest_lines.append(f"- {title} — {dom}" if dom else f"- {title}")
         sources_digest = "\n".join(sources_digest_lines) if sources_digest_lines else "(none)"
 
+        dc = docs_chunks or {}
+        dc_ok = bool(_pick(dc, "ok", False))
+        dc_scopes = _pick(dc, "scopes", [])
+        dc_chunks = _pick(dc, "chunks", [])
+        chat_logger.info(
+            "chat.response_writer.docs_chunks",
+            dc_ok=dc_ok,
+            dc_scopes=dc_scopes[:3] if isinstance(dc_scopes, list) else [],
+            dc_chunks_count=len(dc_chunks) if isinstance(dc_chunks, list) else -1,
+            dc_first_preview=(_safe_str((dc_chunks[0] or {}).get("text") if isinstance(dc_chunks, list) and dc_chunks else "")[:220]),
+        )
+
+        if not isinstance(dc_scopes, list):
+            dc_scopes = []
+        if not isinstance(dc_chunks, list):
+            dc_chunks = []
+
+        docs_snippets = []
+        for ch in dc_chunks[:8]:
+            if not isinstance(ch, dict):
+                continue
+            txt = _safe_str(ch.get("text") or ch.get("content") or "").strip()
+            if not txt:
+                continue
+            # hard cap par chunk
+            if len(txt) > 600:
+                txt = txt[:599] + "…"
+            docs_snippets.append(f"- {txt}")
+
+        docs_block = "\n".join(docs_snippets) if docs_snippets else "(none)"
+
+        # --- Intent prompt block (ONE mechanism for ALL intents) ---
+        # On injecte uniquement les variables nécessaires au bloc d'intent.
+        # Si l'intent n'a pas de bloc dans le registry, load_user_prompt_block doit renvoyer "" (ou fallback safe).
+        intent_vars: Dict[str, str] = {}
+
+        # Vars communes qui peuvent servir à plusieurs intents
+        intent_vars.update({
+            "transition_window": ("true" if transition_window else "false"),
+            "transition_reason": (_safe_str(transition_reason)[:80] if transition_reason else "null"),
+        })
+
+        # Vars par intent (clean)
+        if intent == "smalltalk_intro":
+            intent_vars.update({
+                "smalltalk_target_key": (_safe_str(smalltalk_target_key) if smalltalk_target_key else "null"),
+            })
+
+        if intent == "discovery":
+            gates = _pick(ctx, "gates", {}) or {}
+            intent_vars.update({
+                "discovery_forced": ("true" if bool(gates.get("discovery_forced")) else "false"),
+                "discovery_status": (_safe_str(gates.get("discovery_status") or "null")),
+            })
+
+        # (Option) si tu as des intents qui doivent afficher l'éligibilité
+        if intent in ("action_request", "professional_request", "deep_work"):
+            intent_vars.update({
+                "intent_eligible": ("true" if intent_eligible else "false"),
+                "intent_block_reason": (_safe_str(intent_block_reason)[:80] if intent_block_reason else "null"),
+            })
+
+        # Vars spécifiques smalltalk_intro (si intent déclenché)
+        intent_vars.update({
+            "smalltalk_target_key": (_safe_str(smalltalk_target_key) if smalltalk_target_key else "null"),
+        })
+
+        # Vars spécifiques discovery (si intent déclenché)
+        gates = _pick(ctx, "gates", {}) or {}
+        intent_vars.update({
+            "discovery_forced": ("true" if bool(gates.get("discovery_forced")) else "false"),
+            "discovery_status": (_safe_str(gates.get("discovery_status") or "null")),
+        })
+
+        # ✅ Injection : un seul bloc, activé uniquement si intent connu du registry
+        intent_block = load_user_prompt_block(intent=intent, vars=intent_vars).strip()
+
+        # --- Paywall block (optional) ---
+        paywall_block = ""
+        if should_soft_warn:
+            paywall_block = load_user_prompt_block(intent="paywall_soft_warning", vars={}).strip()
+
+        chat_logger.info(
+            "chat.response_writer.prompt_flags",
+            intent=intent,
+            mode=mode,
+            quota_used=quota_used,
+            quota_limit=quota_limit,
+            quota_state=quota_state,
+            is_pro=is_pro,
+            should_soft_warn=should_soft_warn,
+            paywall_should_show=paywall_should_show,
+        )
+
+        # --- User prompt (clean params + blocks) ---
         user_prompt = f"""
 MESSAGE UTILISATEUR:
 {user_message}
 
-PARAMÈTRES:
-- intent: {intent}
+PARAMÈTRES (pour répondre):
 - language: {language}
 - tone: {tone}
-- include_smalltalk: {include_smalltalk}
-- need_web: {need_web}
 - tutoiement: {use_tu_form}
+- tutoiement_known: {use_tu_known}
 - user_name: {_safe_str(user_name) if user_name else "null"}
 
 QUOTA (si présent):
@@ -238,8 +285,11 @@ QUOTA (si présent):
 - limit: {_safe_str(quota_limit)}
 - paywall_should_show: {paywall_should_show}
 
-CONTEXTE (JSON compact):
-{ctx_text}
+DOCS_CHUNKS (si présent):
+- ok: {dc_ok}
+- scopes: {", ".join([_safe_str(s) for s in dc_scopes[:3]]) if dc_scopes else "[]"}
+- chunks (extraits):
+{docs_block}
 
 WEB_SEARCH (si présent):
 - ok: {ws_ok}
@@ -247,37 +297,31 @@ WEB_SEARCH (si présent):
 - sources (titles + domains only):
 {sources_digest}
 
+CONTEXTE (JSON compact, référence):
+{ctx_text}
+
 INSTRUCTIONS DE RÉPONSE:
 - Réponds dans la langue "{language}".
 - Si tutoiement=true, tutoie. Sinon vouvoie.
-- Si user_name est dispo, tu peux l’utiliser 1 fois max.
 - Respecte strictement les CONVENTIONS UI.
 - Si web_search ok=true, utilise ses faits en priorité.
 - Si tu ajoutes des sources, utilise seulement le bloc "{SOURCES_BLOCK_HEADER}" et 1 à 3 puces sans URL.
-- Une seule "✅ Prochaine étape" max si tu en mets une.
-- NE PARLE PAS du quota / paywall sauf si l’utilisateur demande ou si le back te demande explicitement (ce n’est pas le cas ici).
+- Si DOCS_CHUNKS ok=true et chunks non vides, utilise ces extraits comme source prioritaire (avant le contexte compact).
+
+{paywall_block}
+
+{intent_block}
 """.strip()
 
         try:
             # --- Compose system prompt (versionné) ---
             p = load_lisa_system_prompts()  # version via env LISA_SIGNATURE_VERSION
             system_prompt = (
-                f"{p['signature']}\n\n"
-                f"{p['format']}\n\n"
-                "ANTI-PATTERNS INTERDITS\n"
-                "- Style robot : \"Voici une réponse structurée...\" / \"En tant qu'IA...\" / \"Je ne peux pas...\"\n"
-                "- Listes interminables.\n"
-                "- Reposer 5 questions à la suite.\n"
-                "- Répéter le message user.\n"
-                "- Promettre une action réelle (emails, réservation, etc.) si le mode n'est pas actif.\n\n"
-                "RÈGLES CONTENU (intent)\n"
-                "- amabilities : 1-2 phrases, chaleureuse, pas de question.\n"
-                "- urgent_request : ton calme, rassurant, direct. Pas de small talk.\n"
-                "- sensitive_question : prudence + limites + reco pro si nécessaire.\n"
-                "- functional_question : expliquer ce que Lisa peut / ne peut pas faire.\n"
-                "- decision_support : options + critères + reco nuancée + 1 prochaine étape.\n"
-                "- action_request : si mode Personal, tu n'exécutes pas, tu proposes plan/template.\n\n"
-                f"(Prompts version: {p['version']})"
+                SYSTEM_RESPONSE_WRITER_PROMPT.strip()
+                + "\n\n"
+                + f"{p['signature']}\n\n"
+                + f"{p['format']}\n\n"
+                + f"(Prompts version: {p['version']})"
             )
 
             text, meta = await self.llm.chat_text(
@@ -287,6 +331,7 @@ INSTRUCTIONS DE RÉPONSE:
                 ],
                 temperature=0.4,
                 max_tokens=900,
+                trace={"agent": "response_writer", "intent": intent, "mode": mode},
             )
         except Exception as e:
             return {
@@ -306,6 +351,53 @@ INSTRUCTIONS DE RÉPONSE:
 
         if intent == "amabilities" and len(answer) > 260:
             answer = answer[:257] + "..."
+
+         # --- Force soft warning (do NOT rely on LLM obedience) ---
+        def _pick_soft_warn(language: str, use_tu: bool) -> str:
+            lang = (language or "fr").lower().strip()
+            is_en = lang.startswith("en")
+
+            if is_en:
+                # EN
+                return (
+                    "By the way: to keep chatting without interruptions after this message, activate your free trial."
+                    if use_tu
+                    else "By the way: to keep chatting without interruptions after this message, activate your free trial."
+                )
+
+            # FR (default)
+            return (
+                "Au fait juste pour te prévenir : pour qu’on puisse continuer la discussion sans coupure, il faudra activer l’essai gratuit."
+                if use_tu
+                else "Au fait : pour continuer la discussion sans coupure après ce message, pensez à activer votre essai gratuit."
+            )
+
+        def _already_has_soft_warn(text: str) -> bool:
+            low = (text or "").lower()
+            # heuristiques simples (anti-doublon)
+            if "free trial" in low or "trial" in low:
+                return True
+            if "essai gratuit" in low or ("essai" in low and "activer" in low):
+                return True
+            return False
+
+        if should_soft_warn and not _already_has_soft_warn(answer):
+            soft = _pick_soft_warn(language=language, use_tu=use_tu_form)
+
+            answer = (answer or "").rstrip()
+
+            # séparation clean
+            if answer and answer[-1] not in ".!?":
+                answer += "."
+
+            answer += " " + soft
+
+            chat_logger.info(
+                "chat.paywall.soft_warn.appended",
+                language=language,
+                use_tu_form=use_tu_form,
+                should_soft_warn=should_soft_warn,
+            )
 
         return {
             "ok": True,

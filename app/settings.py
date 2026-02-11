@@ -25,5 +25,9 @@ class Settings(BaseSettings):
     openai_model_fallback: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL_FALLBACK")
     openai_base_url: str = Field(default="https://api.openai.com", alias="OPENAI_BASE_URL")
 
+    n8n_userfact_webhook_url: str | None = Field(default=None, alias="N8N_USERFACT_WEBHOOK_URL")
+    n8n_userfact_webhook_enabled: bool = Field(default=False, alias="N8N_USERFACT_WEBHOOK_ENABLED")
+    n8n_userfact_webhook_timeout_ms: int = Field(default=1200, alias="N8N_USERFACT_WEBHOOK_TIMEOUT_MS")
+
 
 settings = Settings()

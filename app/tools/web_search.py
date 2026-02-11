@@ -61,8 +61,6 @@ class WebSearchTool:
 
         # --- Call Perplexity ---
         result, meta = await self.llm.chat_json(
-            provider="perplexity",
-            model="sonar-pro",
             messages=[
                 {"role": "system", "content": SYSTEM_WEB_SEARCH_PROMPT},
                 {"role": "user", "content": prompt},
