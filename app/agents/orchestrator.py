@@ -17,6 +17,7 @@ from app.agents.node_registry import (
 IntentType = Literal[
     "smalltalk_intro",
     "discovery",
+    "onboarding",
     "small_talk",
     "amabilities",
     "functional_question",
@@ -68,98 +69,182 @@ Quota freemium : 8 messages gratuits (lifetime). Au-delà : paywall.
 INTENTS (classification exhaustive)
 
 smalltalk_intro
-→ Small talk de connexion “strict” pour collecter les facts minimum (tu/vous, prénom, ville, activité)
-→ Actif seulement si quota OK ET facts minimum incomplets
-→ Au niveau orchestrator : tu actives le mode via inputs vers response_writer
+
+→ Small talk de connexion strict pour collecter les facts minimum (tu/vous, prénom, ville, activité).
+→ Actif seulement si quota OK ET facts minimum incomplets.
+→ Au niveau orchestrator : tu actives le mode via inputs vers response_writer.
 → level=light
 
-RÈGLE SMALLTALK_INTRO (DÉTERMINISTE):
+RÈGLE SMALLTALK_INTRO (DÉTERMINISTE)
 Si ctx.user_status.is_pro = false
 ET ctx.user_status.state != "blocked"
 ET ctx.user_status.free_quota_used < ctx.user_status.free_quota_limit
 ET ctx.user_facts.missing_required_count > 0
 ALORS intent = smalltalk_intro
-SAUF si le dernier message utilisateur est manifestement hors phase d'intro
+SAUF si le dernier message utilisateur est manifestement hors phase d’intro
 (ex: question produit, demande urgente, sujet sensible, etc.).
 
+⸻
+
 discovery
-→ Phase de découverte guidée (présentation + cadrage).
-→ Source de vérité: ctx.gates.discovery_forced et ctx.gates.discovery_status.
-→ intent=discovery si ctx.gates.discovery_forced=true ET ctx.gates.discovery_status != "complete".
+
+→ Phase de découverte guidée (présentation + cadrage) : “qu’est-ce que Lisa peut faire pour moi ?”
 → level=light
 
-RÈGLES DOCUMENTATION (Discovery):
-- scope_need = true
-- Tu DOIS sélectionner 1 à 3 scopes maximum dans la liste "DOCUMENTATION DISPONIBLE (SCOPES EXACTS)"
-- scopes_selected doit être une liste de strings
-- Si aucun scope n'est pertinent, alors scope_need=false et scopes_selected=[]
-
-RÈGLE PRIORITAIRE (DÉTERMINISTE):
+RÈGLE PRIORITAIRE (DÉTERMINISTE — cas forcé)
 Si ctx.gates.discovery_forced = true ET ctx.gates.discovery_status != "complete"
 ALORS intent = discovery (peu importe le message utilisateur)
-SAUF si intent doit être urgent_request ou sensitive_question.
+SAUF si l’intent doit être urgent_request ou sensitive_question.
+
+RÈGLE NON CONTRAINTE (LIBRE ARBITRE — exploration du champ des possibles)
+Même si ctx.gates.discovery_forced = false, tu peux choisir intent=discovery si :
+	•	l’utilisateur explore de façon vague le champ des possibles (“tu peux faire quoi pour moi”, “comment tu peux m’aider”, “par où commencer”, “je veux voir ce que tu sais faire”),
+	•	OU l’utilisateur poursuit naturellement la séquence de découverte initiée (ex: après une réponse discovery, il demande “ok et ensuite ?”, “donne-moi des exemples”, “quels cas d’usage ?”).
+
+Distinction clé vs functional_question
+	•	discovery = exploration large / intention floue / cadrage global / “quoi pour moi ? / gibberish/test clavier (“jhgfsghdjs”, “aaaaa”, etc.) ”
+	•	functional_question = question précise sur une fonctionnalité, une règle, un pricing, un aspect RGPD/CGV, etc.
+
+RÈGLES DOCUMENTATION (Discovery)
+	•	scope_need = true
+	•	Tu DOIS sélectionner 1 à 5 scopes max dans “DOCUMENTATION DISPONIBLE (SCOPES EXACTS)”
+	•	scopes_selected = liste de strings
+	•	Si aucun scope pertinent : scope_need=false et scopes_selected=[]
+    •	Scope obligatoire dès que discovery actif ou toute question qui permet de chosiir la meilleure offre HeyLisa par profil = "discovery.value_proposition"
+
+⸻
+
+onboarding (critique payant)
+
+→ Phase d’onboarding après activation d’un mode payant (Personal / Ultimate / Mode Pro).
+→ Objectif : aider l’utilisateur à prendre la main sur le service qu’il vient de payer (setup, cadrage, premières actions, connexions).
+→ level=medium (ou max si mode Pro sensible type médical)
+
+Déclencheurs / Signaux forts
+	•	Message proactif de Lisa post-paiement (“merci / bienvenue / on configure”)
+	•	L’utilisateur demande “on commence”, “comment on setup”, “je veux connecter X”, “explique-moi le process”, “quelles infos tu as besoin”
+	•	Les échanges sont centrés sur : setup, permissions, connexions, règles, préférences, workflow de démarrage, checklist.
+
+RÈGLE DE CONTINUITÉ (dynamique)
+Tant que la conversation reste dans la dynamique du 1er message post paiement (guidage setup), tu restes en onboarding.
+Même si Lisa pose des questions (“combien de personnes”, “à qui je reporte”, etc.), ce n’est pas du smalltalk, c’est de l’onboarding.
+
+Source de vérité (backend attendu)
+Tu utilises ctx.onboarding (ou équivalent) dès qu’il existe.
+	•	ctx.onboarding.status ∈ (pending,started,complete)
+	•	ctx.onboarding.active_agent_mode (ex: ultimate, medical, airbnb)
+	•	ctx.onboarding.started_at
+
+Sortie déterministe “complete” (logique attendue côté backend)
+	•	Si mode = personal_assistant : complete si l’utilisateur réécrit spontanément >48h après started_at.
+	•	Si mode = ultimate ou pro : complete dès qu’au moins un des événements arrive après paiement :
+	1.	une demande d’action réalisée (action_request)
+	2.	une intégration connectée / permission validée
+
+Tant que ctx.onboarding.status == started et pas complete, l’intent onboarding doit être fortement favorisé (sauf urgence/sensible).
+
+⸻
 
 small_talk
-→ Conversation légère, prise de nouvelles, glaner facts clés (tutoiement, ville, activité, etc.)
-→ Signaux : "Comment ça va ?", "Quoi de neuf ?", "Ça roule ?"
+
+→ Conversation légère, prise de nouvelles, lien social, glaner facts non bloquants.
+→ Signaux : “Comment ça va ?”, “Quoi de neuf ?”, “Ça roule ?”
 → level=medium
+
+⚠️ Règle dynamique : si un thread est actif (deep_work / decision_support / onboarding / professional_request / action_request), un “ok / go / continue” n’est pas small_talk.
+
+⸻
 
 amabilities
-→ Salutation départ, politesse finale, remerciement bref
-→ Signaux : "Au revoir", "Bonne nuit", "Merci", "Bye", "À plus"
-→ level=light, AUCUN small talk, réponse brève
+
+→ Salutation départ, politesse finale, remerciement bref.
+→ Signaux : “Au revoir”, “Bonne nuit”, “Merci”, “Bye”, “À plus”
+→ level=light ; réponse brève ; aucun small talk
 → PAS de quota_check (node B retiré)
 
+⚠️ Règle dynamique : si le message est un “merci/ok” dans un thread actif, ce n’est pas amabilities (continuité > politesse).
+
+⸻
+
 functional_question
-→ Question sur HeyLisa (fonctionnement, features, RGPD, CGV, prix)
-→ Signaux : "Que peux-tu faire ?", "Comment tu fonctionnes ?", "Tes fonctionnalités ?", "RGPD ?", "Prix ?"
+
+→ Question sur HeyLisa : fonctionnement, features, RGPD, CGV, prix, limites, compatibilités.
+→ Signaux : “Comment tu organises les mails ?”, “Je clique où pour ouvrir l'espace Deep Work ?”, “RGPD ?”, “Je veux supprimer mon compte”
 → level=medium
+
+Distinction : si l’utilisateur est en exploration vague “quelles sont tes fonctionnalités ?”, c’est discovery, pas functional_question.
+
+⸻
 
 general_question
-→ Connaissance générale, actualité, culture, info pratique
-→ Signaux : "Capitale France ?", "Météo demain ?", "Qui a gagné le match ?"
+
+→ Connaissance générale, info pratique, culture, actualité.
+→ Signaux : “Capitale…”, “Météo…”, “Qui a gagné…”, “C’est quoi…”
 → level=medium
+
+⸻
 
 decision_support
-→ Aide choix, dilemme, décision importante
-→ Signaux : "Aide-moi à choisir", "Je ne sais pas quoi faire", "Dois-je X ou Y ?"
+
+→ Aide au choix, à la décision / dilemme / arbitrage important.
+→ Signaux : “Aide-moi à choisir”, “Dois-je X ou Y ?”, “Quelle option est la meilleure ?”
 → level=max
+
+⸻
 
 motivational_guidance
-→ Encouragement, motivation, perspective philosophique
-→ Signaux : "Je suis découragé", "J'ai besoin de motivation", "Pourquoi continuer ?"
+
+→ Motivation / soutien / perspective / recadrage.
+→ Signaux : “Je suis découragé”, “J’ai besoin de motivation”, “Pourquoi continuer ?”
 → level=max
+
+⸻
 
 action_request
-→ Demande exécution action concrète
-→ Signaux : "Réserve-moi X", "Rappelle-moi de Y", "Envoie email à Z"
+
+→ Demande d’exécution d’une action concrète.
+→ Signaux : “Réserve…”, “Rappelle-moi…”, “Envoie un email…”, “Planifie…”
 → level=medium
-→ Si mode Personal : déclinaison + upsell Ultimate
+
+⸻
 
 deep_work
-→ Travail approfondi (analyse doc, synthèse, développement (code), rédaction, recherche complexe)
-→ Signaux : "Analyse ce document", "Synthèse de X", "Recherche tout sur Y", "travail logiciel"
-→ level=medium (ou max si lié projets user)
+
+→ Travail approfondi : analyse, synthèse, dev, rédaction, recherche complexe.
+→ Signaux : “Analyse ce document”, "travaillon sur mon mémoire", “Synthèse de…”, “Recherche tout sur…”, “écris / code…”
+→ level=medium (ou max si lié aux projets/contraintes de l’utilisateur)
+
+⸻
 
 professional_request
-→ Demande liée métier spécialisé (patient, client, dossier, cabinet)
-→ Signaux : "Mon patient X", "Dossier client Y", "Réservation Airbnb"
+
+→ Demande liée à un métier / cadre pro spécifique (dossier client/patient, cabinet, Airbnb ops).
+→ Signaux : “Mon patient…”, “Dossier client…”, “Réservation Airbnb…”
 → level=max
-→ Si mode pro absent : proposer activation
+→ Si mode pro absent : proposer activation du mode correspondant.
+
+⸻
 
 sensitive_question
-→ Santé, finance perso, juridique, info sensible
-→ Signaux : "Symptômes X", "Problème santé", "Mes finances", "Impôts", "Juridique"
-→ level=max, mode sécurisé (renvoi pro qualifié)
+
+→ Santé, finance perso, juridique, info sensible.
+→ Signaux : symptômes, impôts, juridique, situation médicale, etc.
+→ level=max 
+
+⸻
 
 urgent_request
-→ Urgence, panique, stress aigu, besoin immédiat
-→ Signaux : "Urgent !", "Je panique", "Aide vite", "Critique", "Là maintenant"
-→ level=medium, AUCUN small talk, tone=calm
 
-Priorité si ambiguïté :
-urgent_request > sensitive_question > professional_request > decision_support > 
-action_request > functional_question > general_question > motivational_guidance > 
+→ Urgence, panique, stress aigu, besoin immédiat.
+→ Signaux : “Urgent”, “Je panique”, “Là maintenant”, “Critique”
+→ level=medium 
+
+⸻
+
+Priorité si ambiguïté
+
+urgent_request > sensitive_question > onboarding > professional_request > decision_support >
+action_request > functional_question > general_question > motivational_guidance >
 discovery > small_talk > amabilities
 
 ═══════════════════════════════════════════════════════════════
@@ -186,6 +271,25 @@ Sinon web_search_prompt=null.
 
 {render_nodes_whitelist_block()}
 {render_ids_rules_block()}
+
+═══════════════════════════════════════════════════════════════
+RÈGLE CLÉ — DYNAMIQUE DE CONVERSATION (OBLIGATOIRE)
+
+Tu ne classes JAMAIS l'intent uniquement sur le dernier message.
+Tu dois d'abord analyser la dynamique des 10 derniers messages (ctx.history.messages) :
+
+- Si une tâche est en cours (deep_work / decision_support / professional_request / action_request),
+  alors un message court ("ok", "vas-y", "continue", "parfait", "merci") signifie très souvent :
+  -> continuer le même intent (continuité de thread), pas "amabilities".
+
+- Si le dernier intent assistant est disponible (metadata intent_final/mode), tu l'utilises comme signal fort
+  pour interpréter le message utilisateur, sauf si le contexte global ne rend plus la conversation éligible à un intent donné (smalltalk_intro).
+
+Le dernier message utilisateur sert surtout à ajuster :
+- la priorité,
+- need_web,
+- les scopes docs,
+- et le niveau de contexte.
 
 TON JOB
 Analyser message user dans son contexte (tenir compte des échanges précédents) → Produire plan DAG optimal pour répondre au dernier message user.
@@ -382,6 +486,18 @@ def _compute_discovery_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
         "transition_reason": gates.get("transition_reason"),
     }
 
+def _compute_onboarding_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    ob = (ctx or {}).get("onboarding") or {}
+    status = ob.get("status")  # started|complete|None
+    pro_mode = bool(ob.get("pro_mode"))
+    agent_key = ob.get("primary_agent_key")
+    return {
+        "onboarding_status": status,
+        "pro_mode": pro_mode,
+        "primary_agent_key": agent_key,
+        "onboarding_active": (status == "started" and pro_mode),
+    }
+
 
 def _compute_capabilities(ctx: Dict[str, Any]) -> Dict[str, Any]:
     caps = (ctx or {}).get("capabilities") or {}
@@ -413,6 +529,8 @@ def _apply_business_gates(
     caps = _compute_capabilities(ctx)
     discvr = _compute_discovery_gate(ctx)
     discovery_forced = bool(discvr.get("discovery_forced"))
+    obg = _compute_onboarding_gate(ctx)
+    onboarding_active = bool(obg.get("onboarding_active"))
 
     eligible_intro = bool(gate["smalltalk_intro_eligible"])
     short_ack = _is_short_ack(user_message)
@@ -452,6 +570,11 @@ def _apply_business_gates(
         mode = "discovery"
         intent_final = "discovery"
 
+    # 2bis) Forced onboarding (payant) si started + pro_mode
+    if onboarding_active and intent_final not in {"urgent_request", "sensitive_question"}:
+        mode = "onboarding"
+        intent_final = "onboarding"
+
     # 3) Pendant intro: absorb amabilities/small_talk
     if mode == "smalltalk_intro" and intent_final in {"amabilities", "small_talk"}:
         intent_final = "smalltalk_intro"
@@ -459,6 +582,9 @@ def _apply_business_gates(
     # 4) Pendant discovery: absorb amabilities/small_talk aussi
     if mode == "discovery" and intent_final in {"amabilities", "small_talk"}:
         intent_final = "discovery"
+
+    if mode == "onboarding" and intent_final in {"amabilities", "small_talk"}:
+        intent_final = "onboarding"
 
     # 4bis) Capabilities gating
     intent_eligible = True

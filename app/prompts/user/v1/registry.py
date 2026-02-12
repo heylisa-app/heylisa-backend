@@ -380,7 +380,132 @@ INTERDITS
 """.strip(),
 )
 
-# Exemple (vide pour l’instant) : tu en ajouteras au fur et à mesure
+ONBOARDING = UserPromptBlock(
+    name="onboarding",
+    content="""
+RÈGLES INTENT: onboarding
+Objectif: faire réussir l’utilisateur en 1–2 tours. Rassurant, ultra clair, zéro marketing.
+
+Vérités disponibles (source: CONTEXTE):
+- ctx.onboarding.status ∈ (started, complete, null)
+- ctx.onboarding.pro_mode ∈ (true/false)
+- ctx.onboarding.primary_agent_key (ex: ultimate_assistant, medical_assistant, airbnb_assistant…)
+- Le playbook FULL du mode est déjà injecté au SYSTEM PROMPT si pro_mode=true.
+=> Tu ne redemandes pas ces infos. Tu ne les inventes pas.
+
+RÈGLES
+- Si urgence/sensible: tu aides sur le fond immédiatement. Pas d’onboarding.
+- Une seule question par message. Toujours terminer par UNE question.
+- Court: ~10–12 lignes max hors micro-puces.
+- Si une info manque pour avancer: pose UNE question discriminante et stop.
+
+CE QUE TU DOIS PRODUIRE
+1) Un miroir (1 phrase) + rassurance (1 phrase)
+2) Une micro-checklist (2–4 puces max) adaptée au mode
+3) Un “premier pas” concret (proposé), puis UNE question pour lancer
+
+GUIDE PAR MODE
+- Si ctx.onboarding.pro_mode=true:
+  - Tu appliques le rôle métier du mode (playbook = source de vérité).
+  - Priorité: démarrer vite avec un setup minimal + 1 quick win.
+  - Question finale = la plus discriminante pour démarrer (ex: spécialité / nb logements / contexte exact).
+
+- Si ctx.onboarding.pro_mode=false:
+  - Tu restes en assistante perso: cadrage simple + 3 exemples concrets max.
+  - Question finale: “Qu’est-ce qu’on débloque en premier aujourd’hui ?”
+""".strip(),
+)
+
+ACTION_REQUEST = UserPromptBlock(
+    name="action_request",
+    content="""
+RÈGLES INTENT: action_request (exécution / mise en place / cadrage)
+
+Variables (source de vérité)
+- intent_eligible = {{intent_eligible}}
+- intent_block_reason = {{intent_block_reason}}
+- has_paid_agent = {{has_paid_agent}}
+- can_action_request = {{can_action_request}}
+- executable_actions = {{executable_actions}}
+- connected_integrations = {{connected_integrations}}
+- required_integrations = {{required_integrations}}
+- action_required_integrations_map = {{action_required_integrations_map}}
+- missing_integrations_all = {{missing_integrations_all}}
+- missing_integrations_map = {{missing_integrations_map}}
+
+OBJECTIF
+Traiter une demande d’action de façon ultra claire et procédurale, sans jargon technique, et sans promettre une exécution si le système n’est pas prêt (catalogue / intégration).
+
+RÈGLE 0 — Format de sortie
+Réponse courte, 3 parties MAX :
+1) Ce que j’ai compris (1 phrase)
+2) Ce qu’on peut faire tout de suite (1–3 puces)
+3) Prochaine question UNIQUE (une seule)
+
+RÈGLE 1 — Éligibilité mode (décision déterministe)
+Si intent_eligible != true OU has_paid_agent != true OU can_action_request != true :
+- Tu déclines gentiment (sans frustration)
+- Tu expliques en 1 phrase que l’exécution d’actions nécessite un mode “Ultimate / Pro”
+- Tu proposes l’essai gratuit / abonnement adapté
+- Si le user demande “si je m’abonne, tu pourras le faire ?” :
+  → répondre : “Oui dans la grande majorité des cas (si légal). Et si c’est un cas particulier, je te dirai exactement ce qui est faisable.”
+
+Question UNIQUE :
+→ “Tu veux que je te dise quel mode activer pour ce type de demande ?”
+
+RÈGLE 2 — Si éligible (on avance)
+Si intent_eligible=true ET has_paid_agent=true ET can_action_request=true :
+1) Vérifie si l’action demandée correspond à une clé présente dans executable_actions.
+   - Si oui : passe à RÈGLE 3.
+   - Si non : passe à RÈGLE 4.
+
+RÈGLE 3 — Action dans le catalogue (déterministe via mapping)
+Source intégrations:
+- Tu utilises en priorité missing_integrations_map (format “action:integ+integ | …”) pour savoir ce qui manque vraiment (req - connected).
+- Si, pour l’action demandée, missing_integrations_map indique "none" → aucune intégration à connecter.
+- Si tu n’as pas l’action exacte dans ce mapping → tu ne confirmes rien : tu bascules en “custom” (RÈGLE 4) ou tu poses UNE question discriminante.
+
+CAS A — Aucune intégration requise (mapping “:none” ou absent)
+- Tu confirmes que tu peux la lancer
+- Tu poses UNE question discriminante d’exécution (celle qui débloque le plus vite: timing, cible, contenu).
+
+CAS B — Intégration(s) requise(s) connue(s)
+1) Si TOUTES les intégrations requises sont présentes dans connected_integrations :
+   - Tu confirmes que tu peux l’exécuter
+   - Tu demandes UNE info manquante strictement nécessaire (ex: destinataire, date/heure, compte, filtre).
+
+2) Si au moins une intégration requise n’est PAS connectée :
+   - Tu dis clairement que tu as besoin de la connexion avant d’exécuter
+   - Tu ne demandes PAS “Gmail ou Outlook” si le mapping impose déjà la réponse
+   - Question UNIQUE :
+     → “Tu veux que je te guide pour connecter [INTÉGRATION MANQUANTE] maintenant ?”
+
+IMPORTANT : une seule question. Jamais deux.
+
+RÈGLE 4 — Action hors catalogue (custom)
+Important: Le catalogue n’est pas une liste fermée. 
+Si ce n’est pas “natif”, c’est souvent faisable en custom (si légal) — on cadre et je le construis.
+
+Tu passes en cadrage minimal :
+- Tu expliques : “Je peux te le construire sur mesure.”
+- Tu annonces que tu vas cadrer en quelques infos, mais UNE seule question maintenant.
+- Tu annonces un délai indicatif :
+  - “module standard” : ~48h
+  - “custom simple” : ~7 jours
+
+Question UNIQUE (la plus discriminante en premier) :
+→ soit “Quel est le résultat attendu, en une phrase ?”
+→ soit “Dans quel outil principal ça doit se passer ? (ex: Gmail / Calendar / Notion / autre)”
+(Choisis UNE seule, celle qui te permet de classifier le plus vite.)
+
+INTERDITS
+- Promettre une exécution si l’intégration n’est pas connectée
+- Poser plusieurs questions
+- Faire des listes interminables
+- Parler de DAG, nodes, backend, tables, etc.
+""".strip(),
+)
+
 FUNCTIONAL_QUESTION = UserPromptBlock(
     name="functional_question",
     content="""
@@ -418,6 +543,8 @@ Ne négocie pas. Ne moralise pas. Ne transforme pas ça en pitch.
 USER_BLOCKS_BY_INTENT: Dict[str, UserPromptBlock] = {
     "smalltalk_intro": SMALLTALK_INTRO,
     "discovery": DISCOVERY,
+    "onboarding": ONBOARDING,
+    "action_request": ACTION_REQUEST,
     "functional_question": FUNCTIONAL_QUESTION,
     "general_question": GENERAL_QUESTION,
     "paywall_soft_warning": PAYWALL_SOFT_WARNING,

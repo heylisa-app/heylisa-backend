@@ -1086,3 +1086,193 @@ Si `has_docs=false` côté `chat.response_writer.call`, le problème est avant (
 ---
 
 
+✅ 2026-02-12 — Onboarding / Activation d’agents (v1) + Push notif ✅
+
+Objectif
+
+Quand un user active un agent (ex: Personal Assistant, Ultimate, Medical Assistant…), Lisa doit :
+	1.	relancer la conversation proactivement dans le chat (message écrit en DB),
+	2.	envoyer une push notif fiable,
+	3.	marquer l’onboarding de cet agent (state machine simple) pour piloter la suite via l’orchestrator.
+
+⚠️ Règle produit : on ne parle jamais “d’abonnement / paiement / plan”.
+On parle relation + nouveau champ des possibles.
+
+⸻
+
+Source of truth “abonnement agent”
+
+La table public.lisa_user_agents est la source de vérité :
+	•	À la création de compte : tous les agents sont créés en status='off'
+	•	Un user a “vraiment” activé un agent uniquement si status='active'
+	•	Onboarding attaché à chaque paire (user_id, agent_key) via :
+	•	onboarding_status ∈ { NULL, started, complete }
+	•	pas de pending (supprimé)
+
+⸻
+
+State machine onboarding_status
+
+Backend tool : app/tools/onboarding_update.py
+
+Règles :
+	•	Valeurs autorisées : NULL | started | complete
+	•	Jamais downgrade complete -> started
+	•	complete gagne toujours
+	•	started : set si NULL ou started
+	•	NULL : autorisé uniquement si pas déjà complete
+
+⸻
+
+Déclencheur n8n (activation agent)
+
+Un webhook n8n écoute les INSERT/UPDATE sur lisa_user_agents (payload pg_net).
+
+On normalise l’événement et on déclenche un message uniquement dans ces cas :
+
+Scénarios (v1)
+	•	insert_fresh
+type=INSERT AND status_new=active AND onboarding_new IS NULL
+	•	update_fresh (cas le plus courant)
+type=UPDATE AND status_old=off AND status_new=active AND onboarding_new IS NULL
+	•	update_recover (correction / reprise)
+type=UPDATE AND status_old=off AND status_new=active AND onboarding_old IS NOT NULL
+
+Flag “nouvelle activation vs réactivation”
+On dérive un bool “déjà connu” pour aider Lisa :
+	•	is_reactivation = (onboarding_old = 'started' OR onboarding_old = 'complete')
+	•	sinon is_reactivation = false
+
+⸻
+
+Génération du message (Lisa)
+
+Lisa reçoit :
+	•	agent_key activé
+	•	scenario (insert_fresh / update_fresh / update_recover)
+	•	is_reactivation (bool)
+	•	les 10 derniers messages du chat (avec sent_at) pour respecter tutoiement/vouvoiement et continuité
+
+But : un seul message chaleureux + 1 question claire qui oriente la suite.
+	•	Personal Assistant : “never alone again” (connexion forte)
+	•	Pro mode : “prise de poste maintenant ?” (oriente “intent=Onboarding”)
+	•	Ultimate : “champ des possibles” + “on commence par quoi ?”
+	•	Nuance subtile si réactivation (is_reactivation=true) : ton “content de te retrouver / on reprend”.
+
+⸻
+
+Écriture du message (DB source of truth)
+
+On écrit le message dans public.conversation_messages (sender Lisa).
+
+➡️ Ce write déclenche automatiquement :
+	•	le trigger conversation_messages_enqueue_push
+	•	qui appelle public.enqueue_push(...)
+	•	qui insère un job dans public.push_outbox
+
+On n’utilise pas proactive_messages_queue pour ce flow (mis de côté pour v1).
+
+⸻
+
+Push notifications (DEV et PROD)
+
+Mécanisme : push_outbox + Edge Function “dispatcher” + cron Supabase.
+
+Edge Function
+	•	PROD : push-dispatcher
+	•	DEV : push-dispatcher-dev
+	•	Elle fait :
+	1.	pop_push_outbox(p_limit=25)
+	2.	should_send_push(user_id, kind)
+	3.	récupère les tokens dans push_devices
+	4.	envoie à Expo (https://exp.host/--/api/v2/push/send)
+	5.	mark push_outbox.status='sent' ou failed
+
+Cron Supabase
+Un cron job appelle la function toutes les minutes.
+
+Point critique (DEV)
+La function doit avoir :
+	•	verify_jwt = false
+
+Sinon : 401 et aucun push ne part (la function ne s’exécute même pas).
+
+⸻
+
+Contrat de fin de flow (Definition of Done)
+
+Le flow est considéré terminé quand :
+	1.	un message Lisa est visible dans conversation_messages,
+	2.	une ligne est créée dans push_outbox (status queued puis sent),
+	3.	la push arrive sur le téléphone,
+	4.	on set onboarding_status='started' pour (user_id, agent_key) via onboarding_update.
+
+⸻
+
+Files / composants impliqués (v1)
+	•	Backend:
+	•	app/tools/onboarding_update.py
+	•	DB:
+	•	public.lisa_user_agents
+	•	public.conversation_messages
+	•	public.push_outbox
+	•	triggers conversation_messages_enqueue_push
+	•	RPC: enqueue_push, pop_push_outbox, should_send_push
+	•	Supabase Edge:
+	•	supabase/functions/push-dispatcher-dev/index.ts (DEV)
+	•	cron “push-dispatcher-dev” (every minute)
+	•	n8n:
+	•	Webhook onboarding-start + normalizer + writer
+
+✅ Checklist migration DEV → PROD (zéro surprise)
+
+1) Base de données (PROD)
+	•	Vérifier que les triggers existent sur public.conversation_messages :
+	•	conversation_messages_enqueue_push
+	•	(outbox_on_lisa_tech_issue si tu veux garder le monitoring)
+	•	(trg_update_intro_smalltalk si toujours utilisé)
+	•	Vérifier que les RPC existent :
+	•	enqueue_push, pop_push_outbox, should_send_push, upsert_push_device_safe
+
+2) Edge Function (PROD)
+	•	Déployer la function push-dispatcher (ou vérifier qu’elle est bien la bonne version)
+	•	Vérifier les env vars côté Supabase :
+	•	SUPABASE_URL
+	•	SUPABASE_SERVICE_ROLE_KEY
+	•	Vérifier que verify_jwt = false (sinon 401 silencieux)
+
+3) Cron Supabase (PROD)
+	•	Vérifier le cron job push-dispatcher :
+	•	schedule * * * * * (every minute)
+	•	type = “Supabase Edge Function”
+	•	edge function = push-dispatcher
+	•	method POST
+	•	timeout OK (1000ms suffit)
+
+4) n8n (PROD)
+	•	Le webhook DB → n8n (trigger lisa_user_agents) pointe bien sur l’URL prod (pas dev)
+	•	Les credentials Supabase utilisés dans n8n = service role prod (sinon insert bloqué par RLS)
+
+5) Test “bout en bout” avant d’ouvrir les vannes
+	1.	Dans PROD, force un agent status: off -> active pour ton user test
+	2.	Attends :
+	•	1 ligne dans conversation_messages
+	•	1 ligne push_outbox queued puis sent
+	3.	Confirme : push reçue sur le tel
+	4.	Confirme : onboarding_status passé à started
+
+6) Plan B (si push ne part pas)
+	•	Si push_outbox reste en queued :
+	•	regarder les logs Edge Function : erreur 401 / no_tokens / expo_XXX
+	•	Si status=failed + error=no_tokens :
+	•	le souci est côté push_devices (token absent ou pas “ExponentPushToken…”)
+
+7) Règle anti-casse (très importante)
+	•	On migre en copiant strictement :
+	•	edge function + cron
+	•	triggers + RPC
+	•	et on teste avec un user test avant toute activation réelle.
+
+8) Definition of Done PROD
+
+✅ Push reçue + ✅ message chat écrit + ✅ onboarding_status set started

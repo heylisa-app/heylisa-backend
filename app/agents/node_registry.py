@@ -10,6 +10,7 @@ NODE_TYPE_WHITELIST: Final[Tuple[str, ...]] = (
     "tool.web_search",
     "agent.response_writer",
     "tool.docs_chunks",
+    "tool.onboarding_update",
 )
 
 # ✅ Convention IDs (pareil: source unique)

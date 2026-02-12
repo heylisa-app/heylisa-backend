@@ -214,6 +214,41 @@ async def handle_chat_message(
     # 6) Insert assistant message (idempotent via dedupe_key)
     dedupe_key = f"a:{conversation_id}:{user_message_id}"
 
+    # --- Persist orchestration decision into assistant metadata (for continuity) ---
+    mode = None
+    try:
+        for n in (orch.plan or {}).get("nodes", []):
+            if isinstance(n, dict) and n.get("type") == "agent.response_writer":
+                mode = ((n.get("inputs") or {}) if isinstance(n.get("inputs"), dict) else {}).get("mode")
+                break
+    except Exception:
+        mode = None
+
+    # --- intent_final robuste (source: orch.debug.intent_final si dispo) ---
+    intent_final = None
+    try:
+        dbg = getattr(orch, "debug", None)
+        if isinstance(dbg, dict):
+            intent_final = dbg.get("intent_final") or dbg.get("intent")  # fallback
+    except Exception:
+        intent_final = None
+
+    if not intent_final:
+        intent_final = getattr(orch, "intent", None)
+
+    assistant_meta = {
+        "event_type": "backend_chat",
+        "provider": provider,
+
+        # continuity keys
+        "orch": {
+            "intent_final": str(intent_final or ""),
+            "mode": str(mode or ""),
+            "need_web": bool(getattr(orch, "need_web", False)),
+            "confidence": float(getattr(orch, "confidence", 0.0) or 0.0),
+        }
+    }
+
     inserted = await conn.fetchrow(
         """
         insert into public.conversation_messages
@@ -228,7 +263,7 @@ async def handle_chat_message(
         conversation_id,
         public_user_id,
         reply_text,
-        json.dumps({"event_type": "backend_chat", "provider": provider}, default=str),
+        json.dumps(assistant_meta, default=str),
         dedupe_key,
     )
 

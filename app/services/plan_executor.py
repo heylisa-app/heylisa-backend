@@ -14,6 +14,7 @@ from app.tools.web_search import WebSearchTool
 from app.agents.response_writer import ResponseWriterAgent
 from app.agents.node_registry import NODE_TYPE_WHITELIST
 from app.core.chat_logger import chat_logger
+from app.tools.onboarding_update import onboarding_update
 
 
 SAFE_FALLBACK_ANSWER = "Désolé — j’ai eu un souci technique. Réessaie dans quelques secondes."
@@ -348,6 +349,19 @@ class PlanExecutor:
             answer_len=len(answer or ""),
         )
 
+        # --- Auto onboarding_update (best effort) ---
+        # Si le response_writer a tourné en intent=onboarding, on tente de passer started->complete.
+        try:
+            if isinstance(final, dict) and str(final.get("debug", {}).get("intent") or "") == "onboarding":
+                upd = await onboarding_update(
+                    self.conn,
+                    user_id=str(self.public_user_id),
+                    agent_key=None,
+                )
+                debug_pack["onboarding_update"] = _preview(upd, max_chars=900) if DEBUG_PIPELINE else {"ok": True}
+        except Exception as _e:
+            debug_pack["onboarding_update_error"] = True
+
         return {
             "answer": answer,
             "debug": debug_pack,
@@ -447,6 +461,33 @@ class PlanExecutor:
             )
 
             return {"ok": True, "scopes": scopes, "chunks": chunks[:DOCS_CHUNKS_MAX]}
+
+        if ntype == "tool.onboarding_update":
+            # Tool autonome :
+            # - user_id = self.public_user_id (source de vérité)
+            # - agent_key optionnel (si tu veux cibler un agent précis)
+            # - pas de onboarding_status en entrée : c’est le tool qui décide started->complete
+            agent_key = inputs.get("agent_key")
+            agent_key = str(agent_key).strip() if isinstance(agent_key, str) and agent_key.strip() else None
+
+            try:
+                res = await onboarding_update(
+                    self.conn,
+                    user_id=str(self.public_user_id),
+                    agent_key=agent_key,   # None => scan all started
+                )
+                return res if isinstance(res, dict) else {"ok": True, "result": res}
+            except Exception as e:
+                # Best effort: on ne casse jamais la réponse utilisateur
+                chat_logger.error(
+                    "chat.onboarding_update.error",
+                    conversation_id=str(self.conversation_id),
+                    public_user_id=str(self.public_user_id),
+                    agent_key=agent_key,
+                    error=str(e)[:300],
+                    exc_info=True,
+                )
+                return {"ok": False, "error": "ONBOARDING_UPDATE_FAILED"}
 
         if ntype == "agent.response_writer":
             # On injecte automatiquement ctx/quota/web si présents
