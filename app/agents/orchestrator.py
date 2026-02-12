@@ -114,7 +114,7 @@ RÈGLES DOCUMENTATION (Discovery)
 
 ⸻
 
-onboarding (critique payant)
+onboarding 
 
 → Phase d’onboarding après activation d’un mode payant (Personal / Ultimate / Mode Pro).
 → Objectif : aider l’utilisateur à prendre la main sur le service qu’il vient de payer (setup, cadrage, premières actions, connexions).

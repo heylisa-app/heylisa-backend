@@ -403,13 +403,19 @@ class PlanExecutor:
 
         if ntype == "tool.quota_check":
             status = await get_quota_status(self.conn, str(self.public_user_id))
+
+            # ✅ Seule info "commerciale" autorisée à atteindre le LLM :
+            # soft warning UNIQUEMENT au dernier message gratuit (7/8) et seulement si non-pro.
+            is_pro = bool(status.is_pro)
+            used = int(status.used)
+            limit = int(status.limit)
+
+            should_soft_warn = (not is_pro) and (used == 7) and (limit == 8)
+
             return {
                 "ok": True,
-                "is_pro": bool(status.is_pro),
-                "used": int(status.used),
-                "limit": int(status.limit),
-                "state": str(status.state),
-                "paywall_should_show": (not status.is_pro) and (status.used >= status.limit),
+                "is_pro": is_pro,
+                "should_soft_warn": should_soft_warn,
             }
 
         if ntype == "tool.web_search":
