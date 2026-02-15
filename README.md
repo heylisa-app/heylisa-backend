@@ -1276,3 +1276,318 @@ Files / composants impliqués (v1)
 8) Definition of Done PROD
 
 ✅ Push reçue + ✅ message chat écrit + ✅ onboarding_status set started
+
+
+✅ Convention unique ajout webhook N8N (obligatoire)
+
+	1.	Créer le path env
+
+	•	N8N_<EVENT>_WEBHOOK_PATH=<path-sans-leading-slash>
+
+	2.	Créer un wrapper python
+
+	•	app/integrations/n8n_<event>.py :
+	•	appelle fire_n8n_webhook(... path_env="N8N_<EVENT>_WEBHOOK_PATH")
+
+	3.	Appel dans le code
+
+	•	fire-and-forget si non critique :
+	•	asyncio.create_task(fire_<event>_webhook(payload))
+
+	4.	n8n
+
+	•	Le webhook node utilise exactement le même path que N8N_<EVENT>_WEBHOOK_PATH
+	•	(optionnel) si N8N_WEBHOOK_SECRET est défini, vérifier X-Webhook-Secret
+
+
+
+⚠️ NOTE DÉPLOIEMENT SUPABASE FUNCTIONS
+
+Toujours utiliser --use-api pour éviter dépendance Docker
+Toujours utiliser --prune en DEV uniquement (supabase functions deploy --use-api --prune)
+
+=====================================
+
+NOTE POUR LE 1ER PUSH PROD BACKEND DB
+
+N1.
+en PROD, il faudra exécuter la même migration SQL (table app_config + fonctions + trigger rewrite) et mettre app_config.n8n_webhook_base_url = https://n8n.heylisa.io/webhook.
+(update public.app_config
+set value = 'https://n8n.heylisa.io/webhook',
+    updated_at = now()
+where key = 'n8n_webhook_base_url';)
+
+Voilà ce qui a été fait en DEV : 
+ce trigger crée la config + les fonctions + remplace le trigger existant.
+
+
+-------------
+-- 1) Table de config (1 ligne)
+create table if not exists public.app_config (
+  key text primary key,
+  value text not null,
+  updated_at timestamptz not null default now()
+);
+
+-- Base URL pour DEV
+insert into public.app_config(key, value)
+values ('n8n_webhook_base_url', 'https://n8n-dev.heylisa.io/webhook')
+on conflict (key) do update set
+  value = excluded.value,
+  updated_at = now();
+
+-- 2) Helper: récupérer une valeur de config
+create or replace function public.get_app_config(p_key text, p_default text default null)
+returns text
+language sql
+stable
+as $$
+  select coalesce(
+    (select value from public.app_config where key = p_key),
+    p_default
+  );
+$$;
+
+-- 3) Helper: construire l'URL finale (base + path)
+create or replace function public.n8n_webhook_url(p_path text)
+returns text
+language plpgsql
+stable
+as $$
+declare
+  base_url text;
+  clean_base text;
+  clean_path text;
+begin
+  base_url := public.get_app_config('n8n_webhook_base_url', null);
+  if base_url is null or length(trim(base_url)) = 0 then
+    raise exception 'Missing app_config.n8n_webhook_base_url';
+  end if;
+
+  -- normalisation simple des slashes
+  clean_base := regexp_replace(trim(base_url), '/+$', '');
+  clean_path := regexp_replace(coalesce(trim(p_path), ''), '^/+', '');
+
+  return clean_base || '/' || clean_path;
+end;
+$$;
+
+-- 4) Caller: wrapper autour de supabase_functions.http_request
+-- Note: http_request attend headers/body en TEXT (JSON string)
+create or replace function public.call_n8n_webhook(
+  p_path text,
+  p_payload jsonb,
+  p_timeout_ms int default 5000
+)
+returns void
+language plpgsql
+as $$
+declare
+  url text;
+  headers text;
+  body text;
+begin
+  url := public.n8n_webhook_url(p_path);
+
+  headers := '{"Content-type":"application/json"}';
+  body := coalesce(p_payload, '{}'::jsonb)::text;
+
+  perform supabase_functions.http_request(
+    url,
+    'POST',
+    headers,
+    body,
+    p_timeout_ms::text
+  );
+end;
+$$;
+
+-- 5) Trigger function spécifique pour onboarding-start
+create or replace function public.trg_lisa_user_agents_onboarding_start()
+returns trigger
+language plpgsql
+as $$
+begin
+  -- payload = NEW row + action
+  perform public.call_n8n_webhook(
+    'onboarding-start',
+    jsonb_build_object(
+      'table', TG_TABLE_NAME,
+      'op', TG_OP,
+      'new', to_jsonb(NEW),
+      'old', case when TG_OP = 'UPDATE' then to_jsonb(OLD) else null end
+    ),
+    5000
+  );
+
+  return NEW;
+end;
+$$;
+
+-- 6) Remplacer le trigger existant (celui qui a l'URL en dur)
+drop trigger if exists "addon_onboarding-start" on public.lisa_user_agents;
+
+create trigger "addon_onboarding-start"
+after insert or update on public.lisa_user_agents
+for each row
+execute function public.trg_lisa_user_agents_onboarding_start();
+--------
+
+
+====================================
+
+N2. NOTE (push prod checklist) : supprimer progressivement les variables legacy N8N_*_WEBHOOK_URL une fois que base+path est validé partout (sinon un jour quelqu’un remet une URL complète “au hasard” et tu reperds la standardisation).
+
+N3. NOTE (push prod checklist) : vérifier que N8N_WEBHOOK_BASE_URL diffère bien entre Railway DEV et PROD (n8n-dev vs n8n).
+
+N4. NOTE (push prod checklist) : s’assurer que le webhook user-fact/catcher existe côté n8n prod avec le même path, et que le secret correspond.
+
+N5. NOTE (push prod checklist) : vérifier que N8N_WEBHOOK_BASE_URL est bien https://n8n.heylisa.io/webhook sur Railway PROD.
+
+N6. NOTE (push prod checklist)
+	•	DROP sur PROD au moment du push (ou écrasement via migrations DEV), sinon PROD continuera d’appeler des webhooks morts/externes.
+	•	Rotate le secret x-addon-secret qui apparaît dans le SQL dump (il a fuité dans ton diff local, donc par principe on le considère compromis).
+
+Je te donne déjà le SQL “propre” à garder pour le jour du push prod (tu ne l’exécutes pas maintenant si tu veux garder l’état PROD intact jusqu’au go-live).
+
+-- NOTE PUSH PROD: cleanup legacy n8n triggers (neatik-ai.app.n8n.cloud)
+
+drop trigger if exists addon_event on public.lisa_user_agents;
+drop trigger if exists new_prospect_email_chat on public.users;
+drop trigger if exists proactive_messages on public.proactive_events_outbox;
+drop trigger if exists send_proactive_messages on public.proactive_messages_queue;
+drop trigger if exists tool_event on public.lisa_user_integrations;
+
+
+📜 Journal d’implémentation
+
+✅ 2026-02-14 — RevenueCat Offerings + Supabase Realtime + app_config (standardisation PROD-ready)
+
+Contexte / Pourquoi
+On a observé deux problèmes “invisibles mais mortels” :
+	1.	RevenueCat : un produit peut exister (products + entitlements OK) mais ne pas être présent dans l’Offering → le paywall / pricing / purchase se comportent mal (fallback, produit manquant, confusion côté UI).
+	2.	Supabase Realtime : le front peut afficher SUBSCRIBED côté channel, mais ne recevoir aucun event si la table n’est pas ajoutée à la publication supabase_realtime → donc pas de toast, pas de sync instant, et debug très trompeur.
+
+En parallèle, on a acté une standardisation propre pour les webhooks n8n via public.app_config afin d’éviter les URLs hardcodées et les divergences DEV/PROD.
+
+⸻
+
+1) RevenueCat — Règle Offering (piège confirmé)
+
+Fait important :
+	•	Avoir un Product + un Entitlement ne suffit pas.
+	•	Pour être “achetable/affichable” correctement, le produit doit être ajouté dans l’Offering active (ex: live_default), via un Package.
+
+Symptômes typiques quand le produit n’est pas dans l’Offering :
+	•	Produit manquant dans la liste offerings.current.availablePackages
+	•	Prix incohérent (fallback ou mapping sur un autre produit)
+	•	Comportement “ça marche pour 3 modules mais pas pour Ultimate” → exactement ce qu’on a vu.
+
+Note UI RevenueCat (nouveau champ Identifier) :
+RevenueCat a introduit/renforcé la notion d’Identifier pour les packages.
+Tu n’es pas obligé d’utiliser les “preset” type monthly si RC ne te le propose pas : tu peux créer un identifier custom (ex: ultimate_monthly) et l’utiliser en code via l’identifiant du package (RC loggue d’ailleurs : custom duration).
+
+DoD RC :
+	•	offerings.current.availablePackages contient bien le produit attendu
+	•	le log products liste bien le produit (ultimate_assistant etc.)
+	•	le paywall propose le bon prix et l’achat fonctionne
+
+⸻
+
+2) Supabase Realtime — Pourquoi le toast ne s’affichait pas
+
+Ce qui était trompeur :
+	•	côté app : logs subscribe status SUBSCRIBED ✅
+	•	côté Supabase Dashboard (Replication view) : rien (normal, car ce screen “Replication” ≠ “Realtime”)
+	•	résultat : aucun event reçu, donc aucun toast.
+
+Cause racine :
+La table public.lisa_user_agents n’était pas incluse dans la publication supabase_realtime.
+
+✅ Fix appliqué :
+alter publication supabase_realtime add table public.lisa_user_agents;
+
+Important :
+	•	alter table ... replica identity full; est utile dans certains cas (UPDATE/DELETE complets), mais ne suffit pas si la table n’est pas dans supabase_realtime.
+	•	Le fait que la “vue replication” soit “vide” n’est pas un indicateur fiable pour Realtime.
+
+DoD Realtime :
+	•	l’app reçoit bien les events postgres_changes sur lisa_user_agents
+	•	le toast peut se déclencher (activation/désactivation)
+
+⸻
+
+3) Toast “Mode activé” — Règle anti-faux-positif (sécurité produit)
+
+Objectif : aucun toast ne doit s’afficher “par erreur”.
+
+Décision actée :
+	•	Le toast est déclenché sur event Realtime DB (lisa_user_agents status change)
+	•	MAIS on ne “célèbre” l’activation que si RevenueCat confirme que l’entitlement est actif.
+
+Donc :
+	•	DB dit active ✅
+	•	RC dit entitlement actif ✅ → toast success
+	•	sinon → toast skip + log debug
+
+Cela évite :
+	•	activation fantôme (DB activée mais achat non confirmé)
+	•	race conditions
+	•	incohérences RC/DB
+
+⸻
+
+4) Standardisation Webhooks n8n via public.app_config (DEV/PROD clean)
+
+But :
+Ne plus hardcoder des URLs n8n dans des triggers SQL.
+Avoir :
+	•	1 base URL configurable par environnement (DEV vs PROD)
+	•	des paths stables (onboarding-start, etc.)
+	•	un point de vérité unique.
+
+✅ Implémenté en DEV :
+	•	public.app_config (key/value)
+	•	public.get_app_config(key, default)
+	•	public.n8n_webhook_url(path)
+	•	public.call_n8n_webhook(path, payload)
+	•	trigger addon_onboarding-start basé sur call_n8n_webhook('onboarding-start', payload)
+
+Règle PROD (au moment du push) :
+Mettre n8n_webhook_base_url à la valeur PROD :
+update public.app_config
+set value = 'https://n8n.heylisa.io/webhook',
+    updated_at = now()
+where key = 'n8n_webhook_base_url';
+
+
+⸻
+
+5) Checklist rapide DEV → PROD (sur ce scope)
+
+Realtime
+	•	public.lisa_user_agents est dans supabase_realtime
+
+RevenueCat
+	•	produits ajoutés dans l’Offering active
+	•	packages identifiers cohérents (ex: ultimate_monthly)
+	•	paywall affiche prix correct
+
+n8n + app_config
+	•	app_config.n8n_webhook_base_url = PROD
+	•	triggers SQL pointent sur call_n8n_webhook() (pas URL en dur)
+	•	paths n8n PROD existants (ex: onboarding-start)
+
+Sécurité
+	•	plan de rotation du secret webhook si une valeur a fuité dans un dump/diff
+
+⸻
+
+6) Décisions actées (à ne pas rediscuter au prochain bug 😄)
+	•	RevenueCat : Offering obligatoire sinon produit invisible/mal mappé.
+	•	Supabase : Realtime = publication supabase_realtime, pas l’écran “Replication”.
+	•	UI : toast “Mode activé” = DB event + validation RC, jamais seulement DB.
+	•	Webhooks : URLs n8n centralisées via app_config, base+path, pas de hardcode.
+
+
+	

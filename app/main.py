@@ -1,4 +1,6 @@
 # app/main.py
+from dotenv import load_dotenv
+load_dotenv()
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -9,6 +11,8 @@ import structlog
 from app.api.routes import router
 from app.db.pool import init_pool, close_pool
 from app.settings import settings
+
+
 
 # --- Logging setup (ONCE, at import time) ---
 setup_logging()

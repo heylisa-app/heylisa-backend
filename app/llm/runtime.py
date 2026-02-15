@@ -85,10 +85,18 @@ class LLMRuntime:
             "Content-Type": "application/json",
         }
 
-    def _chat_url(self, base_url: str) -> str:
-        # Accept both ".../v1" and root base URLs
+    def _chat_url(self, provider: Dict[str, Any]) -> str:
+        base_url = provider["base_url"]
+        name = provider["name"]
+
+        # Perplexity → pas de /v1
+        if name == "perplexity":
+            return f"{base_url}/chat/completions"
+
+        # Providers OpenAI-compatible classiques
         if base_url.endswith("/v1"):
             return f"{base_url}/chat/completions"
+
         return f"{base_url}/v1/chat/completions"
 
     async def chat_text(
@@ -260,7 +268,7 @@ class LLMRuntime:
         max_tokens: int,
         response_format: Optional[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        url = self._chat_url(provider["base_url"])
+        url = self._chat_url(provider)
         headers = self._headers(provider["api_key"])
 
         body: Dict[str, Any] = {
