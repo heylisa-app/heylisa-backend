@@ -14,6 +14,7 @@ dist/
 # Environment
 .env
 .env.local
+.env.*
 
 # IDE
 .vscode/
@@ -34,3 +35,8 @@ Thumbs.db
 
 # Virtualenv
 .venv/
+
+# n8n is in its own repo — never track it here
+heylisa-n8n/
+# local audits / dumps
+supabase_audit/
