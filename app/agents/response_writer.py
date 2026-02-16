@@ -8,6 +8,7 @@ from app.llm.runtime import LLMRuntime
 from app.prompts.loader import load_lisa_system_prompts
 from app.prompts.user.loader import load_user_prompt_block
 from app.core.chat_logger import chat_logger
+from app.core.llm_prompt_logger import log_llm_messages
 
 from uuid import UUID
 from datetime import datetime, date
@@ -417,11 +418,29 @@ INSTRUCTIONS DE RÉPONSE:
 
                 system_prompt = system_prompt + "\n\n" + header + "\n\nPLAYBOOK (FULL) — MODE ACTIF\n" + ob_playbook
 
+            llm_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+
+            log_llm_messages(
+                event="llm.prompt.response_writer",
+                messages=llm_messages,
+                trace={"agent": "response_writer", "intent": intent, "mode": mode},
+                extra={
+                    "language": language,
+                    "need_web": need_web,
+                    "ws_ok": ws_ok,
+                    "dc_ok": dc_ok,
+                    "paywall_should_show": paywall_should_show,
+                    "should_soft_warn": should_soft_warn,
+                    "intro_smalltalk_done": intro_smalltalk_done,
+                    "intro_smalltalk_turns": intro_smalltalk_turns,
+                },
+            )
+
             text, meta = await self.llm.chat_text(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages=llm_messages,
                 temperature=0.4,
                 max_tokens=900,
                 trace={"agent": "response_writer", "intent": intent, "mode": mode},

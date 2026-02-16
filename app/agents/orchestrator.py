@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Literal
 
 from app.llm.runtime import LLMRuntime
+from app.core.llm_prompt_logger import log_llm_messages
 
 from app.agents.node_registry import (
     NODE_TYPE_WHITELIST,
@@ -814,11 +815,21 @@ class OrchestratorAgent:
         docs_block = _render_docs_scopes_block(ctx)
         system_prompt = SYSTEM_PROMPT + docs_block
 
+        llm_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        # ✅ FULL PROMPT LOG (chunked) — Orchestrator
+        # (Ton llm_prompt_logger.py gère déjà le chunking, donc pas de log_big.py)
+        log_llm_messages(
+            event="llm.prompt.orchestrator",
+            messages=llm_messages,
+            trace={"agent": "orchestrator", "phase": "intent+plan"},
+        )
+
         data, meta = await self.llm.chat_json(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=llm_messages,
             temperature=0.1,
             trace={"agent": "orchestrator", "phase": "intent+plan"},
         )
