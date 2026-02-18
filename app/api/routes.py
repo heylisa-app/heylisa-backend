@@ -9,6 +9,9 @@ from app.services.quota import get_quota_status
 from app.services.auth import get_auth_user_id_from_bearer, AuthError
 from app.services.chat import handle_chat_message, ChatError
 from app.services.chat_intro import handle_chat_intro, ChatIntroError
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
