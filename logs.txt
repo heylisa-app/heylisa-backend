@@ -1,0 +1,8 @@
+INFO:     Will watch for changes in these directories: ['/Users/bricengouo/dev/heylisa-backend']
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [38995] using WatchFiles
+{"event": "logging_configured", "logger": "app.main", "level": "info", "timestamp": "2026-02-16T10:51:00.156374Z"}
+INFO:     Started server process [38998]
+INFO:     Waiting for application startup.
+{"environment": "dev", "service": "heylisa-backend", "event": "heylisa_backend_started", "logger": "app.main", "level": "info", "timestamp": "2026-02-16T10:51:01.057464Z"}
+INFO:     Application startup complete.

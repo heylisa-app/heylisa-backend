@@ -1,3 +1,5 @@
+#app/services/auth.py
+
 import httpx
 from app.settings import settings
 
@@ -34,6 +36,13 @@ async def get_auth_user_id_from_bearer(authorization: str | None) -> str | None:
         raise AuthError("Supabase auth env missing (SUPABASE_URL / SUPABASE_ANON_KEY)")
 
     url = f"{settings.supabase_url.rstrip('/')}/auth/v1/user"
+
+    print("[AUTHDBG] env=", settings.environment)
+    print("[AUTHDBG] supabase_url=", settings.supabase_url)
+    print("[AUTHDBG] anon_prefix=", (settings.supabase_anon_key or "")[:12])
+    print("[AUTHDBG] token_prefix=", token[:16])
+    print("[AUTHDBG] user_url=", url)
+
     headers = {
         "Authorization": f"Bearer {token}",
         "apikey": settings.supabase_anon_key,
