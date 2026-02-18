@@ -10,8 +10,9 @@ from app.services.auth import get_auth_user_id_from_bearer, AuthError
 from app.services.chat import handle_chat_message, ChatError
 from app.services.chat_intro import handle_chat_intro, ChatIntroError
 import logging
+import traceback
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("heylisa.chat")
 
 router = APIRouter()
 
@@ -127,4 +128,13 @@ async def chat_message(
         except ChatError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
+            logger.exception(
+                "[CHAT] chat_message crashed",
+                extra={
+                    "conversation_id": body.conversation_id,
+                    "user_message_id": body.user_message_id,
+                    "auth_user_id": auth_user_id,
+                },
+            )
+            print("[CHAT] traceback:\n", traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Internal error: {str(e)[:120]}")
