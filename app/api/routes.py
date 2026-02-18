@@ -1,3 +1,5 @@
+#app/api/routes.py
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 from asyncpg import Pool
@@ -100,10 +102,14 @@ async def chat_message(
     pool: Pool = Depends(get_pool),
     authorization: str | None = Header(default=None),
 ):
+    logger.info("[CHAT] /v1/chat/message hit | has_auth=%s | auth_prefix=%s",
+                bool(authorization),
+                (authorization or "")[:20])
     # Auth (DEV permissif)
     try:
         auth_user_id = await get_auth_user_id_from_bearer(authorization)
     except AuthError as e:
+        logger.warning("[CHAT] auth failed: %s", str(e))
         raise HTTPException(status_code=401, detail=str(e))
 
     async with pool.acquire() as conn:

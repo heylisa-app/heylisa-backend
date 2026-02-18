@@ -1,22 +1,14 @@
-#app/services/auth.py
-
+# app/services/auth.py
 import httpx
+import logging
 from app.settings import settings
 
+logger = logging.getLogger("uvicorn.error")
 
 class AuthError(Exception):
     pass
 
-
 async def get_auth_user_id_from_bearer(authorization: str | None) -> str | None:
-    """
-    Returns auth_user_id (UUID as str) from Supabase Auth /user endpoint.
-
-    DEV behavior:
-      - if ENVIRONMENT=dev and no Authorization => returns None (permissive)
-    PROD behavior (later):
-      - we will require Authorization
-    """
     if not authorization:
         if settings.environment.lower() == "dev":
             return None
@@ -30,18 +22,18 @@ async def get_auth_user_id_from_bearer(authorization: str | None) -> str | None:
         raise AuthError("Empty Bearer token")
 
     if not settings.supabase_url or not settings.supabase_anon_key:
-        # In dev we tolerate; in prod we’ll enforce
         if settings.environment.lower() == "dev":
             return None
         raise AuthError("Supabase auth env missing (SUPABASE_URL / SUPABASE_ANON_KEY)")
 
     url = f"{settings.supabase_url.rstrip('/')}/auth/v1/user"
 
-    print("[AUTHDBG] env=", settings.environment)
-    print("[AUTHDBG] supabase_url=", settings.supabase_url)
-    print("[AUTHDBG] anon_prefix=", (settings.supabase_anon_key or "")[:12])
-    print("[AUTHDBG] token_prefix=", token[:16])
-    print("[AUTHDBG] user_url=", url)
+    # ✅ logs Railway-friendly
+    logger.info("[AUTHDBG] env=%s", settings.environment)
+    logger.info("[AUTHDBG] supabase_url=%s", settings.supabase_url)
+    logger.info("[AUTHDBG] anon_prefix=%s", (settings.supabase_anon_key or "")[:12])
+    logger.info("[AUTHDBG] token_prefix=%s", token[:16])
+    logger.info("[AUTHDBG] user_url=%s", url)
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -52,6 +44,8 @@ async def get_auth_user_id_from_bearer(authorization: str | None) -> str | None:
         r = await client.get(url, headers=headers)
 
     if r.status_code != 200:
+        # ✅ log la réponse Supabase (très utile)
+        logger.warning("[AUTHDBG] supabase /user failed: %s %s", r.status_code, (r.text or "")[:180])
         raise AuthError(f"Supabase auth failed: HTTP {r.status_code}")
 
     data = r.json()
