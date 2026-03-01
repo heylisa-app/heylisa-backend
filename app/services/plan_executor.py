@@ -14,7 +14,7 @@ from app.tools.web_search import WebSearchTool
 from app.agents.response_writer import ResponseWriterAgent
 from app.agents.node_registry import NODE_TYPE_WHITELIST
 from app.core.chat_logger import chat_logger
-from app.tools.onboarding_update import onboarding_update
+from app.tools.user_onboarding import sync_user_onboarding, set_onboarding_fields
 
 
 SAFE_FALLBACK_ANSWER = "Désolé — j’ai eu un souci technique. Réessaie dans quelques secondes."
@@ -323,15 +323,39 @@ class PlanExecutor:
 
         # Convention: la réponse finale doit être dans la sortie du node response_writer
         # Verrou: "answer only" => on sort TOUJOURS une string safe.
+        debug_pack = {
+            "node_outputs": self._debug_compact_outputs(),
+        }
+
+        # --- ESCALATION: if response_writer requests orchestrator reroute ---
+        # --- ESCALATION: response_writer requests orchestrator reroute ---
+        if isinstance(final, dict) and final.get("error") == "ESCALATE_TO_ORCHESTRATOR":
+            reason = (
+                final.get("reason")
+                or final.get("escalate_reason")
+                or final.get("escalate_type")
+                or "unspecified"
+            )
+
+            chat_logger.info(
+                "chat.executor.escalate",
+                conversation_id=str(self.conversation_id),
+                public_user_id=str(self.public_user_id),
+                reason=reason,
+            )
+
+            return {
+                "escalate": True,
+                "escalate_reason": reason,
+                "debug": {"node_outputs": self._debug_compact_outputs()},
+            }
+
+        # --- Normal answer path ---
         answer_raw = None
         if isinstance(final, dict):
             answer_raw = final.get("answer")
 
         answer = _normalize_answer(answer_raw)
-
-        debug_pack = {
-            "node_outputs": self._debug_compact_outputs(),
-        }
 
         # Indicateurs utiles pour diagnostiquer sans casser le front
         if answer == SAFE_FALLBACK_ANSWER:
@@ -341,6 +365,16 @@ class PlanExecutor:
             debug_pack["answer_truncated"] = True
             debug_pack["answer_raw_len"] = len(answer_raw.strip())
 
+        # --- Deterministic user_onboarding sync (non bloquant) ---
+        try:
+            await sync_user_onboarding(
+                self.conn,
+                user_id=str(self.public_user_id),
+            )
+        except Exception:
+            # jamais bloquant
+            pass
+
         chat_logger.info(
             "chat.executor.run_end",
             conversation_id=str(self.conversation_id),
@@ -349,18 +383,31 @@ class PlanExecutor:
             answer_len=len(answer or ""),
         )
 
-        # --- Auto onboarding_update (best effort) ---
-        # Si le response_writer a tourné en intent=onboarding, on tente de passer started->complete.
+        # --- Onboarding sync (best effort) ---
+        # On sync uniquement si onboarding started (sinon NOOP)
         try:
-            if isinstance(final, dict) and str(final.get("debug", {}).get("intent") or "") == "onboarding":
-                upd = await onboarding_update(
-                    self.conn,
-                    user_id=str(self.public_user_id),
-                    agent_key=None,
-                )
-                debug_pack["onboarding_update"] = _preview(upd, max_chars=900) if DEBUG_PIPELINE else {"ok": True}
-        except Exception as _e:
-            debug_pack["onboarding_update_error"] = True
+            ctx_node_id = self._find_first_node_id("tool.db_load_context")
+            ctx = (self.out.get(ctx_node_id) or {}).get("context") if ctx_node_id else {}
+
+            ob_status = None
+            has_pro_mode_active = False
+
+            if isinstance(ctx, dict):
+                ob = (ctx.get("onboarding") or {})
+                if isinstance(ob, dict):
+                    has_pro_mode_active = bool(ob.get("has_pro_mode_active") is True)
+                    row = ob.get("row") or {}
+                    if isinstance(row, dict):
+                        ob_status = (row.get("status") or None)
+
+            should_sync = (ob_status == "started") or ((ob_status in (None, "", "null")) and has_pro_mode_active)
+
+            if should_sync:
+                upd = await sync_user_onboarding(self.conn, user_id=str(self.public_user_id))
+                debug_pack["onboarding_sync"] = _preview(upd, max_chars=900) if DEBUG_PIPELINE else {"ok": True}
+
+        except Exception:
+            debug_pack["onboarding_sync_error"] = True
 
         return {
             "answer": answer,
@@ -468,32 +515,102 @@ class PlanExecutor:
 
             return {"ok": True, "scopes": scopes, "chunks": chunks[:DOCS_CHUNKS_MAX]}
 
-        if ntype == "tool.onboarding_update":
-            # Tool autonome :
-            # - user_id = self.public_user_id (source de vérité)
-            # - agent_key optionnel (si tu veux cibler un agent précis)
-            # - pas de onboarding_status en entrée : c’est le tool qui décide started->complete
-            agent_key = inputs.get("agent_key")
-            agent_key = str(agent_key).strip() if isinstance(agent_key, str) and agent_key.strip() else None
-
+        if ntype == "tool.onboarding_set_fields":
+            # Tool: set onboarding fields (target/level_max/metadata) + sync status (started/complete)
             try:
-                res = await onboarding_update(
+                target = inputs.get("target")
+                level_max = inputs.get("level_max")
+                metadata_patch = inputs.get("metadata_patch")
+
+                if metadata_patch is not None and not isinstance(metadata_patch, dict):
+                    metadata_patch = {}
+
+                res = await set_onboarding_fields(
                     self.conn,
                     user_id=str(self.public_user_id),
-                    agent_key=agent_key,   # None => scan all started
+                    target=str(target).strip() if isinstance(target, str) else None,
+                    level_max=str(level_max).strip() if isinstance(level_max, str) else None,
+                    metadata_patch=metadata_patch,
                 )
                 return res if isinstance(res, dict) else {"ok": True, "result": res}
+
             except Exception as e:
-                # Best effort: on ne casse jamais la réponse utilisateur
                 chat_logger.error(
-                    "chat.onboarding_update.error",
+                    "chat.onboarding_set_fields.error",
                     conversation_id=str(self.conversation_id),
                     public_user_id=str(self.public_user_id),
-                    agent_key=agent_key,
                     error=str(e)[:300],
                     exc_info=True,
                 )
-                return {"ok": False, "error": "ONBOARDING_UPDATE_FAILED"}
+                return {"ok": False, "error": "ONBOARDING_SET_FIELDS_FAILED"}
+
+        if ntype == "tool.playbook_load":
+            agent_key = inputs.get("agent_key")
+            level = str(inputs.get("level") or "light")
+
+            chat_logger.info(
+                "chat.playbook_load.request",
+                conversation_id=str(self.conversation_id),
+                public_user_id=str(self.public_user_id),
+                node_id=str(node.get("id") or "P"),
+                agent_key=str(agent_key or ""),
+                level=str(level),
+            )
+
+            if not isinstance(agent_key, str) or not agent_key.strip():
+                return {"ok": False, "error": "NO_AGENT_KEY"}
+
+            row = await self.conn.fetchrow(
+                """
+                select lisa_playbook, lisa_instructions_short
+                from public.lisa_agents_catalog
+                where agent_key = $1
+                """,
+                agent_key.strip(),
+            )
+
+            chat_logger.info(
+                "chat.playbook_load.db_result",
+                conversation_id=str(self.conversation_id),
+                public_user_id=str(self.public_user_id),
+                node_id=str(node.get("id") or "P"),
+                agent_key=agent_key.strip(),
+                found=bool(row),
+            )
+
+            if not row:
+                return {"ok": False, "error": "AGENT_NOT_FOUND"}
+
+            text = None
+            if level == "full":
+                text = row.get("lisa_playbook")
+            else:
+                text = row.get("lisa_instructions_short")
+
+            text_str = text.strip() if isinstance(text, str) else ""
+            chat_logger.info(
+                "chat.playbook_load.selected",
+                conversation_id=str(self.conversation_id),
+                public_user_id=str(self.public_user_id),
+                node_id=str(node.get("id") or "P"),
+                agent_key=agent_key.strip(),
+                level=str(level),
+                text_len=len(text_str),
+                text_sha=_sha256(text_str) if text_str else None,
+                is_empty=not bool(text_str),
+            )
+
+            if not isinstance(text, str) or not text.strip():
+                return {"ok": False, "error": "PLAYBOOK_EMPTY"}
+
+            return {
+                "ok": True,
+                "agent_key": agent_key.strip(),
+                "level": level,
+                "playbook_text": text_str,
+                "playbook_sha": _sha256(text_str) if text_str else None,
+                "playbook_len": len(text_str),
+            }
 
         if ntype == "agent.response_writer":
             # On injecte automatiquement ctx/quota/web si présents
@@ -504,24 +621,32 @@ class PlanExecutor:
 
             ctx = (self.out.get(ctx_node_id) or {}).get("context") if ctx_node_id else None
             quota = self.out.get(quota_node_id) if quota_node_id else None
+            should_soft_warn = bool((quota or {}).get("should_soft_warn") is True)
             web = self.out.get(web_node_id) if web_node_id else None
             docs_chunks = self.out.get(docs_node_id) if docs_node_id else None
+            playbook_node_id = self._find_first_node_id("tool.playbook_load")
+            playbook = self.out.get(playbook_node_id) if playbook_node_id else None
 
             # Pass-through des inputs orchestrateur (mode, gates, eligibility, etc.)
             rw_inputs = dict(
                 user_message=self.user_message,
+                raw_user_message=self.user_message, 
                 intent=str(inputs.get("intent") or "general_question"),
                 mode=str(inputs.get("mode") or "normal"),
                 language=str(inputs.get("language") or "fr"),
                 tone=str(inputs.get("tone") or "warm"),
                 need_web=bool(inputs.get("need_web") or False),
+                route_source=str(inputs.get("route_source") or "orchestrator"),
+                runtime_state=str(inputs.get("state") or inputs.get("runtime_state") or ""),
                 docs_chunks=docs_chunks or {},
+                playbook=playbook or {},
 
                 smalltalk_target_key=inputs.get("smalltalk_target_key"),
                 intent_eligible=bool(inputs.get("intent_eligible", True)),
                 intent_block_reason=inputs.get("intent_block_reason"),
                 transition_window=bool(inputs.get("transition_window", False)),
                 transition_reason=inputs.get("transition_reason"),
+                soft_paywall_warning = bool(inputs.get("soft_paywall_warning", False)) or should_soft_warn,
 
                 context=ctx or {},
                 quota=quota or {},
@@ -533,6 +658,23 @@ class PlanExecutor:
             ctx_level = str((self.out.get(ctx_node_id) or {}).get("level") or "unknown") if ctx_node_id else "none"
             ctx_summary = _ctx_summary(rw_inputs["context"], level=ctx_level) if rw_inputs.get("context") else {"facts_count": 0}
 
+            pb_agent_key = (playbook or {}).get("agent_key")
+            pb_level = (playbook or {}).get("level")
+            pb_sha = (playbook or {}).get("playbook_sha")
+            pb_len = (playbook or {}).get("playbook_len")
+
+            chat_logger.info(
+                "chat.response_writer.playbook_attached",
+                conversation_id=str(self.conversation_id),
+                public_user_id=str(self.public_user_id),
+                node_id=str(node.get("id") or "D"),
+                playbook_ok=bool((playbook or {}).get("ok")),
+                playbook_agent_key=str(pb_agent_key or ""),
+                playbook_level=str(pb_level or ""),
+                playbook_sha=str(pb_sha or ""),
+                playbook_len=int(pb_len or 0),
+            )
+
             chat_logger.info(
                 "chat.response_writer.call",
                 conversation_id=str(self.conversation_id),
@@ -540,6 +682,8 @@ class PlanExecutor:
                 node_id=str(node.get("id") or "D"),
                 intent=rw_inputs["intent"],
                 mode=rw_inputs["mode"],
+                route_source=rw_inputs.get("route_source"),
+                runtime_state=rw_inputs.get("runtime_state"),
                 language=rw_inputs["language"],
                 need_web=rw_inputs["need_web"],
                 transition_window=bool(rw_inputs.get("transition_window", False)),
@@ -551,6 +695,7 @@ class PlanExecutor:
                 has_quota=bool(rw_inputs["quota"]),
                 has_web=bool(rw_inputs["web"]),
                 has_docs=bool(docs_chunks and isinstance(docs_chunks, dict) and docs_chunks.get("chunks")),
+                has_playbook=bool(playbook and playbook.get("ok")),
             )
 
             res = await self.response_writer.run(**rw_inputs)
@@ -572,6 +717,11 @@ class PlanExecutor:
             return "C" if "C" in self.out else None
         if node_type == "tool.docs_chunks":
             return "S" if "S" in self.out else None
+        # ✅ AJOUTE ÇA
+        if node_type == "tool.onboarding_set_fields":
+            return "O" if "O" in self.out else None
+        if node_type == "tool.playbook_load":
+            return "P" if "P" in self.out else None
         return None
 
     def _debug_compact_outputs(self) -> Dict[str, Any]:
@@ -582,7 +732,7 @@ class PlanExecutor:
                 compact[k] = {"type": type(v).__name__}
                 continue
             keep = {}
-            for key in ("ok", "error", "duration_ms", "provider", "model", "state", "paywall_should_show"):
+            for key in ("ok", "error", "duration_ms", "provider", "model", "state"):
                 if key in v:
                     keep[key] = v[key]
             compact[k] = keep

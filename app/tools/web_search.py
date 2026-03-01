@@ -60,7 +60,7 @@ class WebSearchTool:
             }
 
         # --- Call Perplexity ---
-        result, meta = await self.llm.chat_json(
+        result, meta = await self.llm.web_search_json(
             messages=[
                 {"role": "system", "content": SYSTEM_WEB_SEARCH_PROMPT},
                 {"role": "user", "content": prompt},
