@@ -14,6 +14,7 @@ from app.services.message_flags import extract_and_clean_message_flags
 from app.services.intent_routing.state_resolver import resolve_state
 from app.services.intent_routing.gates import apply_gates
 from app.services.onboarding_state import apply_onboarding_state
+from app.llm.runtime import LLMCallError
 
 SAFE_FALLBACK_ANSWER = "Désolé — je n’ai pas réussi à générer une réponse. Réessaie."
 
@@ -86,6 +87,46 @@ def _pick_discovery_doc_scopes(ctx: dict) -> list[str]:
 
     # base doit exister, sinon on ne bloque pas : on envoie quand même base+fallback
     return [base, second]
+
+
+def _build_failsafe_light_plan(*, ctx: dict, state_decision, soft_paywall_warning: bool) -> dict:
+    """
+    Plan minimal: charge contexte light puis ResponseWriter.
+    Aucun playbook/docs chunks => prompt ultra light.
+    """
+    language = (((ctx or {}).get("settings") or {}).get("locale_main", "fr").split("-")[0]) or "fr"
+    forced_state = str(getattr(state_decision, "state", "") or "normal")
+
+    nodes = [
+        {
+            "id": "A",
+            "type": "tool.db_load_context",
+            "parallel_group": "P1",
+            "inputs": {"level": "light"},
+        },
+        {
+            "id": "D",
+            "type": "agent.response_writer",
+            "depends_on": ["A"],
+            "inputs": {
+                "intent": "",                     # pas d'overlay intent
+                "mode": forced_state,             # state = mode
+                "route_source": "failsafe",       # traçable
+                "runtime_state": forced_state,    # source de vérité RW
+                "state": forced_state,            # idem
+                "language": language,
+                "tone": "warm",
+                "need_web": False,
+                "soft_paywall_warning": bool(soft_paywall_warning),
+                "transition_window": bool(getattr(state_decision, "transition_window", False)),
+                "transition_reason": getattr(state_decision, "transition_reason", None),
+                "smalltalk_target_key": ((ctx or {}).get("gates") or {}).get("smalltalk_target_key"),
+            },
+        },
+    ]
+    return {"nodes": nodes}
+
+
 
 async def handle_chat_message(
     conn: Connection,
@@ -358,7 +399,42 @@ async def handle_chat_message(
         )
 
         orchestrator = OrchestratorAgent(llm)
-        orch = await orchestrator.run(user_message=msg["content"], ctx=ctx)
+
+        try:
+            orch = await orchestrator.run(user_message=msg["content"], ctx=ctx)
+
+        except Exception as e:
+            # ✅ FAIL-SAFE : on ne laisse jamais le chat crasher si l'orchestrator tombe
+            chat_logger.error(
+                "chat.orchestrator.failsafe_triggered",
+                conversation_id=str(conversation_id),
+                user_message_id=str(user_message_id),
+                error_type=type(e).__name__,
+                error=str(e)[:240],
+                exc_info=True,
+            )
+
+            # Plan minimal RW (light)
+            plan = _build_failsafe_light_plan(
+                ctx=ctx or {},
+                state_decision=state_decision,
+                soft_paywall_warning=soft_paywall_warning,
+            )
+
+            # Stub orch compatible avec le reste du pipeline
+            orch = type("OrchStub", (), {})()
+            orch.ok = False
+            orch.intent = ""
+            orch.language = (((ctx or {}).get("settings") or {}).get("locale_main", "fr").split("-")[0]) or "fr"
+            orch.need_web = False
+            orch.confidence = 0.0
+            orch.plan = plan
+            orch.debug = {
+                "intent_final": "",
+                "mode": str(getattr(state_decision, "state", "") or "normal"),
+                "meta": {"provider": "failsafe"},
+                "error_type": type(e).__name__,
+            }
 
         # Ensure route_source + FORCE runtime_state/state for ResponseWriter
         try:

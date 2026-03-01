@@ -9,6 +9,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 import json
 import re  # ✅ AJOUT
+import asyncio
+
+import random
+from dataclasses import dataclass
+from httpx import Timeout
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -16,6 +21,270 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     if v is None or v == "":
         return default
     return v
+
+# =========================
+# Prompt caps (chars)
+# =========================
+STATE_BLOCK_MAX   = 5_000
+PLAYBOOK_MAX      = 8_000
+DOCS_CHUNKS_MAX   = 6_000
+CTX_SUMMARY_MAX   = 6_000
+USER_TEXT_MAX     = 16_000
+
+# Filet de sécurité: cap global par message (si sections introuvables)
+# (On laisse respirer un peu, mais on évite les prompts délirants)
+USER_MESSAGE_HARD_MAX   = 20_000
+SYSTEM_MESSAGE_HARD_MAX = 14_000
+
+# =========================
+# Retry / timeouts
+# =========================
+DEFAULT_CONNECT_TIMEOUT_S = float(_env("LLM_CONNECT_TIMEOUT_S", "10"))
+DEFAULT_READ_TIMEOUT_S    = float(_env("LLM_READ_TIMEOUT_S", "35"))
+DEFAULT_WRITE_TIMEOUT_S   = float(_env("LLM_WRITE_TIMEOUT_S", "20"))
+DEFAULT_POOL_TIMEOUT_S    = float(_env("LLM_POOL_TIMEOUT_S", "10"))
+
+RETRY_BASE_SLEEP_S        = float(_env("LLM_RETRY_BASE_SLEEP_S", "0.6"))
+RETRY_MAX_SLEEP_S         = float(_env("LLM_RETRY_MAX_SLEEP_S", "4.0"))
+RETRY_JITTER_S            = float(_env("LLM_RETRY_JITTER_S", "0.25"))
+
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+@dataclass
+class CapMeta:
+    applied: bool = False
+    system_before: int = 0
+    system_after: int = 0
+    user_before: int = 0
+    user_after: int = 0
+    sections_hit: List[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "applied": self.applied,
+            "system_before": self.system_before,
+            "system_after": self.system_after,
+            "user_before": self.user_before,
+            "user_after": self.user_after,
+            "sections_hit": self.sections_hit or [],
+        }
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    # on coupe proprement et on laisse une note
+    return text[: max_chars - 80] + "\n\n[... tronqué ...]\n"
+
+
+def _cap_section(text: str, *, label: str, max_chars: int, start_patterns: List[str], end_patterns: List[str]) -> Tuple[str, bool]:
+    """
+    Tronque une section délimitée par des marqueurs (regex) si trouvée.
+    Retourne (text_modifié, found?)
+    """
+    if not text:
+        return text, False
+
+    # On cherche un start
+    start_match = None
+    for sp in start_patterns:
+        m = re.search(sp, text, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            start_match = m
+            break
+    if not start_match:
+        return text, False
+
+    start_idx = start_match.start()
+
+    # On cherche un end après start
+    end_idx = None
+    for ep in end_patterns:
+        m2 = re.search(ep, text[start_match.end():], flags=re.IGNORECASE | re.DOTALL)
+        if m2:
+            end_idx = start_match.end() + m2.start()
+            break
+
+    if end_idx is None:
+        # section jusqu'à fin
+        end_idx = len(text)
+
+    section = text[start_match.start():end_idx]
+    if len(section) <= max_chars:
+        return text, True
+
+    capped = _truncate(section, max_chars)
+    new_text = text[:start_match.start()] + capped + text[end_idx:]
+    return new_text, True
+
+
+def _cap_user_content(user_text: str) -> Tuple[str, List[str]]:
+    """
+    Cap “intelligent” : on tronque les sections si on les reconnaît, puis filet hard max.
+    Renvoie (user_text_cappé, sections_hit)
+    """
+    sections_hit: List[str] = []
+
+    # Heuristique markers (à matcher sur tes prompts actuels)
+    # -> Ajustables sans toucher au reste.
+    user_text, hit = _cap_section(
+        user_text,
+        label="STATE_BLOCK",
+        max_chars=STATE_BLOCK_MAX,
+        start_patterns=[
+            r"\[RW_STATE_BLOCK\]",               # vu dans tes logs
+            r"^STATE\b",                         # certains prompts
+            r"STATE\s*\(",                       # "STATE (SOURCE DE VÉRITÉ"
+        ],
+        end_patterns=[
+            r"^\s*PLAYBOOK\b",
+            r"^\s*DOCS?\b",
+            r"^\s*CONTEXT\b",
+            r"^\s*RÈGLES\b",
+            r"^\s*---",
+        ],
+    )
+    if hit: sections_hit.append("STATE_BLOCK")
+
+    user_text, hit = _cap_section(
+        user_text,
+        label="PLAYBOOK",
+        max_chars=PLAYBOOK_MAX,
+        start_patterns=[
+            r"\bPLAYBOOK\b",
+            r"\bAGENT\s+PLAYBOOK\b",
+            r"playbook[_\s]attached",
+        ],
+        end_patterns=[
+            r"^\s*DOCS?\b",
+            r"^\s*CONTEXT\b",
+            r"^\s*STATE\b",
+            r"^\s*---",
+        ],
+    )
+    if hit: sections_hit.append("PLAYBOOK")
+
+    user_text, hit = _cap_section(
+        user_text,
+        label="DOCS_CHUNKS",
+        max_chars=DOCS_CHUNKS_MAX,
+        start_patterns=[
+            r"\bDOCS?\b",
+            r"\bDOCS[_\s]CHUNKS\b",
+            r"\bKNOWLEDGE\b",
+        ],
+        end_patterns=[
+            r"^\s*CONTEXT\b",
+            r"^\s*STATE\b",
+            r"^\s*PLAYBOOK\b",
+            r"^\s*---",
+        ],
+    )
+    if hit: sections_hit.append("DOCS_CHUNKS")
+
+    user_text, hit = _cap_section(
+        user_text,
+        label="CTX_SUMMARY",
+        max_chars=CTX_SUMMARY_MAX,
+        start_patterns=[
+            r"\bCTX\b",
+            r"\bCONTEXT\b",
+            r"\bCTX[_\s]SUMMARY\b",
+        ],
+        end_patterns=[
+            r"^\s*STATE\b",
+            r"^\s*PLAYBOOK\b",
+            r"^\s*DOCS?\b",
+            r"^\s*---",
+        ],
+    )
+    if hit: sections_hit.append("CTX_SUMMARY")
+
+    # USER_TEXT (WhatsApp) : on cap par pattern faible risque.
+    # Si introuvable, le hard max prendra le relais.
+    user_text, hit = _cap_section(
+        user_text,
+        label="USER_TEXT",
+        max_chars=USER_TEXT_MAX,
+        start_patterns=[
+            r"\bMessage utilisateur\b",
+            r"\bUser message\b",
+            r"\bRAW_USER_MESSAGE\b",
+        ],
+        end_patterns=[
+            r"^\s*STATE\b",
+            r"^\s*PLAYBOOK\b",
+            r"^\s*DOCS?\b",
+            r"^\s*CONTEXT\b",
+            r"^\s*---",
+        ],
+    )
+    if hit: sections_hit.append("USER_TEXT")
+
+    # Filet global
+    user_text = _truncate(user_text, USER_MESSAGE_HARD_MAX)
+    return user_text, sections_hit
+
+
+def _normalize_and_cap_messages(messages: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], CapMeta]:
+    """
+    Cap au runtime, sans dépendre du code des agents.
+    - cap system hard max
+    - cap user via sections + hard max
+    """
+    meta = CapMeta(applied=False, sections_hit=[])
+    if not isinstance(messages, list) or not messages:
+        return messages, meta
+
+    new_msgs: List[Dict[str, str]] = []
+    for m in messages:
+        role = (m.get("role") or "").lower()
+        content = m.get("content") or ""
+        if role == "system":
+            meta.system_before += len(content)
+            capped = _truncate(content, SYSTEM_MESSAGE_HARD_MAX)
+            meta.system_after += len(capped)
+            if len(capped) != len(content):
+                meta.applied = True
+            new_msgs.append({**m, "content": capped})
+        elif role == "user":
+            meta.user_before += len(content)
+            capped, hits = _cap_user_content(content)
+            meta.sections_hit.extend([h for h in hits if h not in (meta.sections_hit or [])])
+            meta.user_after += len(capped)
+            if len(capped) != len(content):
+                meta.applied = True
+            new_msgs.append({**m, "content": capped})
+        else:
+            # assistant/tool/etc : on ne touche pas
+            new_msgs.append(m)
+
+    return new_msgs, meta
+
+
+def _is_retryable_exc(e: Exception) -> bool:
+    return isinstance(e, (
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpx.RemoteProtocolError,
+        httpx.WriteTimeout,
+        httpx.PoolTimeout,
+        httpx.NetworkError,
+    ))
+
+
+def _backoff_sleep_s(attempt_idx: int) -> float:
+    # attempt_idx: 0,1,2...
+    base = RETRY_BASE_SLEEP_S * (2 ** attempt_idx)
+    base = min(base, RETRY_MAX_SLEEP_S)
+    jitter = random.random() * RETRY_JITTER_S
+    return base + jitter
+
+
+
 
 
 class LLMCallError(RuntimeError):
@@ -62,7 +331,6 @@ class LLMRuntime:
                 "No LLM API keys configured. Set DEEPSEEK_API_KEY and/or OPENAI_API_KEY."
             )
 
-        self.timeout_s = float(_env("LLM_TIMEOUT_S", "20"))
         self.max_retries = int(_env("LLM_MAX_RETRIES", "0"))
         # ✅ Routing policies
         self.chat_provider_allowlist = {"deepseek", "openai"}      # jamais perplexity pour le chat
@@ -247,12 +515,26 @@ class LLMRuntime:
             .get("content", "")
         ) or ""
 
+        def _extract_first_json_object(s: str) -> Optional[str]:
+            # récupère le premier {...} “raisonnable”
+            m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+            return m.group(0) if m else None
+
         try:
             obj = json.loads(content)
-        except Exception as e:
-            raise LLMCallError(
-                f"LLM returned non-JSON content from {provider['name']}: {content[:180]}"
-            ) from e
+        except Exception:
+            extracted = _extract_first_json_object(content or "")
+            if extracted:
+                try:
+                    obj = json.loads(extracted)
+                except Exception as e2:
+                    raise LLMCallError(
+                        f"LLM returned non-JSON content from {provider['name']}: {content[:180]}"
+                    ) from e2
+            else:
+                raise LLMCallError(
+                    f"LLM returned non-JSON content from {provider['name']}: {content[:180]}"
+                )
 
         meta = {
             "provider": provider["name"],
@@ -299,6 +581,12 @@ class LLMRuntime:
         trace: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         last_err: Optional[Exception] = None
+
+        # ✅ Cap prompts (system/user) + sections
+        messages, cap_meta = _normalize_and_cap_messages(messages)
+
+        if self._trace_enabled():
+            print("[LLM_TRACE] prompt_caps", cap_meta.to_dict())
 
         # --- Heuristique pour le chat (si allowlist = chat) ---
         if raw_user_message is not None:
@@ -435,20 +723,74 @@ class LLMRuntime:
             if self._trace_enabled():
                 print("[LLM_TRACE] store_disabled", {"provider": provider["name"], "store": body.get("store")})
 
+        # ✅ Perplexity: response_format "json_object" n'est pas supporté.
+        # On n'envoie pas response_format du tout (on force le JSON via le prompt côté web_search_json).
         if response_format is not None:
-            body["response_format"] = response_format
+            if provider["name"] != "perplexity":
+                body["response_format"] = response_format
+            else:
+                if self._trace_enabled():
+                    print("[LLM_TRACE] perplexity_skip_response_format", {"requested": response_format})
 
+        timeout = Timeout(
+            connect=DEFAULT_CONNECT_TIMEOUT_S,
+            read=DEFAULT_READ_TIMEOUT_S,
+            write=DEFAULT_WRITE_TIMEOUT_S,
+            pool=DEFAULT_POOL_TIMEOUT_S,
+        )
+
+        attempts = max(1, int(self.max_retries) + 1)
+
+        last_exc: Optional[Exception] = None
         t0 = time.time()
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            r = await client.post(url, headers=headers, json=body)
 
-        duration_ms = int((time.time() - t0) * 1000)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for attempt in range(attempts):
+                try:
+                    r = await client.post(url, headers=headers, json=body)
 
-        if r.status_code < 200 or r.status_code >= 300:
-            raise LLMCallError(
-                f"{provider['name']} HTTP_{r.status_code} {r.text[:180]}"
-            )
+                    # Retry sur statuts "transient"
+                    if r.status_code in RETRYABLE_STATUS:
+                        if attempt < attempts - 1:
+                            if self._trace_enabled():
+                                print("[LLM_TRACE] retry_status", {
+                                    "provider": provider["name"],
+                                    "status": r.status_code,
+                                    "attempt": attempt + 1,
+                                    "attempts": attempts,
+                                })
+                            sleep_s = _backoff_sleep_s(attempt)
+                            await asyncio.sleep(sleep_s)
+                            continue
 
-        data = r.json()
-        data["_meta"] = {"duration_ms": duration_ms}
-        return data, provider
+                    # Erreur non retryable
+                    if r.status_code < 200 or r.status_code >= 300:
+                        raise LLMCallError(f"{provider['name']} HTTP_{r.status_code} {r.text[:180]}")
+
+                    duration_ms = int((time.time() - t0) * 1000)
+                    data = r.json()
+                    data["_meta"] = {"duration_ms": duration_ms}
+                    return data, provider
+
+                except Exception as e:
+                    last_exc = e
+
+                    retryable = _is_retryable_exc(e)
+                    if self._trace_enabled():
+                        print("[LLM_TRACE] retry_exc", {
+                            "provider": provider["name"],
+                            "error_type": type(e).__name__,
+                            "retryable": retryable,
+                            "attempt": attempt + 1,
+                            "attempts": attempts,
+                        })
+
+                    if (attempt < attempts - 1) and retryable:
+                        sleep_s = _backoff_sleep_s(attempt)
+                        await asyncio.sleep(sleep_s)
+                        continue
+
+                    break
+
+        # si on sort de la boucle, c'est qu'on a échoué
+        raise last_exc if isinstance(last_exc, LLMCallError) else LLMCallError(str(last_exc)[:200])

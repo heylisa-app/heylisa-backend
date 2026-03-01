@@ -94,7 +94,13 @@ async def apply_onboarding_state(
     now = datetime.now(timezone.utc)
 
     level_max = (row.get("level_max") or "none").lower()
-    status = row.get("status")
+
+    # Normalise status/target (DB may store 'none'/'null'/None)
+    status = (row.get("status") or "").lower() or None
+
+    row_target = (row.get("target") or "").lower()
+    row_target = None if row_target in ("", "none", "null") else row_target
+
     counter = int(row.get("user_msgs_since_started") or 0)
 
     # -------------------------------------------------
@@ -137,9 +143,20 @@ async def apply_onboarding_state(
         }
 
     # -------------------------------------------------
-    # 3️⃣ Target change (personal -> pro)
+    # 3️⃣ Si onboarding déjà complete → état absorbant (NE JAMAIS RESTART)
     # -------------------------------------------------
-    if target != row.get("target"):
+    if status == "complete":
+        return {
+            "active": False,
+            "target": None,
+            "status": "complete",
+            "reason": "already_complete",
+        }
+
+    # -------------------------------------------------
+    # 4️⃣ Target change (personal -> pro)
+    # -------------------------------------------------
+    if target != row_target:
         await conn.execute(
             """
             update public.user_onboarding
@@ -148,6 +165,7 @@ async def apply_onboarding_state(
                 status = 'started',
                 user_msgs_since_started = 0,
                 started_at = $3,
+                completed_at = null,
                 updated_at = $3
             where user_id = $1
             """,
@@ -160,17 +178,6 @@ async def apply_onboarding_state(
             "target": target,
             "status": "started",
             "reason": "onboarding_restarted_target_change",
-        }
-
-    # -------------------------------------------------
-    # 4️⃣ Si onboarding déjà complete → rien à faire
-    # -------------------------------------------------
-    if status == "complete":
-        return {
-            "active": False,
-            "target": None,
-            "status": "complete",
-            "reason": "already_complete",
         }
 
     # -------------------------------------------------
@@ -201,7 +208,7 @@ async def apply_onboarding_state(
 
     # --- Personal onboarding ---
     if target == "personal":
-        if counter > 10:
+        if counter > 3:
             complete = True
             completion_reason = "personal_msg_threshold"
 
@@ -210,7 +217,7 @@ async def apply_onboarding_state(
         if connected_tools_count >= 1:
             complete = True
             completion_reason = "tool_connected"
-        elif counter > 10:
+        elif counter >= 10:
             complete = True
             completion_reason = "pro_msg_threshold"
 
