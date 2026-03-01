@@ -10,11 +10,12 @@ NODE_TYPE_WHITELIST: Final[Tuple[str, ...]] = (
     "tool.web_search",
     "agent.response_writer",
     "tool.docs_chunks",
-    "tool.onboarding_update",
+    "tool.onboarding_set_fields",
+    "tool.playbook_load",
 )
 
 # ✅ Convention IDs (pareil: source unique)
-DEFAULT_NODE_IDS: Final[Tuple[str, ...]] = ("A", "B", "C", "D", "S")
+DEFAULT_NODE_IDS: Final[Tuple[str, ...]] = ("A", "B", "C", "S", "O", "P", "D")
 
 
 def render_nodes_whitelist_block() -> str:

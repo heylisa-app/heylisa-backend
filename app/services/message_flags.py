@@ -7,16 +7,18 @@ import re
 
 # Match une ligne "flag=true" (avec espaces, casse, etc.)
 _FLAG_LINE_RE = re.compile(
-    r"""(?im)^\s*(aha_moment|onboarding_abort)\s*=\s*(true|false|1|0)\s*$"""
+    r"""(?im)^\s*(aha_moment|aha_request|onboarding_abort)\s*=\s*(true|false|1|0)\s*$"""
 )
 
 @dataclass
 class MessageFlags:
+    aha_request: bool = False
     aha_moment: bool = False
     onboarding_abort: bool = False
 
     def to_metadata(self) -> Dict[str, Any]:
         return {
+            "aha_request": bool(self.aha_request),
             "aha_moment": bool(self.aha_moment),
             "onboarding_abort": bool(self.onboarding_abort),
         }
@@ -45,7 +47,9 @@ def extract_and_clean_message_flags(text: str) -> tuple[str, MessageFlags]:
         val_raw = (m.group(2) or "").strip().lower()
         val = val_raw in ("true", "1")
 
-        if key == "aha_moment":
+        if key == "aha_request":
+            flags.aha_request = flags.aha_request or val
+        elif key == "aha_moment":
             flags.aha_moment = flags.aha_moment or val
         elif key == "onboarding_abort":
             flags.onboarding_abort = flags.onboarding_abort or val

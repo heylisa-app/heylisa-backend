@@ -52,6 +52,23 @@ heylisa-backend/
 
 ---
 
+PROCESSUS SPLIT TERMINAL CURSOR (ultra clean)
+
+Dans Cursor / VS Code :
+
+Terminal → Split Terminal
+À gauche :
+cd ~/dev/heylisa-backend
+
+
+puis : 
+source .venv/bin/activate
+LOG_LEVEL=DEBUG python3 -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+3. À droite :
+cd ~/dev/heylisa-mobile
+npm start
+
 ## ⚙️ Setup local
 
 ### 1) Environnement Python
@@ -1590,4 +1607,649 @@ Sécurité
 	•	Webhooks : URLs n8n centralisées via app_config, base+path, pas de hardcode.
 
 
-	
+
+---
+
+## ✅ Décisions actées — Chat Flow, State Resolver, Discovery (février 2026)
+
+Ce bloc sert de **référence** : si un bug revient, on compare au présent document avant de “réinventer”.
+
+---
+
+### 1) Pipeline Chat (v1) — source of truth DB
+
+**Entrée unique**
+- `POST /v1/chat/message` avec `{ conversation_id, user_message_id }`
+
+**Source de vérité**
+- Les messages (user + Lisa) sont **persistés en DB** (`public.conversation_messages`).
+- Le front est **aligné DB** (UI optimiste, puis reload DB).
+
+**Étapes de traitement backend**
+1. Charge le message user (DB) + checks (ownership best-effort)
+2. Idempotence (si `assistant_message_id` déjà en metadata → renvoie la réponse existante)
+3. Charge le contexte (`load_context_light` minimum pour router)
+4. Résout l’état (`resolve_state`) + gates (`apply_gates`)
+5. Construit un plan (fastpath ou orchestrator)
+6. Exécute le plan via `PlanExecutor`
+7. Nettoie les flags de fin de message (`extract_and_clean_message_flags`)
+8. Persiste le message Lisa + metadata
+9. Post-actions (update discovery_status / smalltalk state) + webhooks n8n (fire-and-forget)
+
+---
+
+### 2) State Resolver (v1) — déterministe, avant LLM
+
+**Objectif**
+- Déterminer l’état conversationnel **sans** dépendre du LLM.
+- Autoriser des “fastpaths” sur des cas simples et stables.
+
+**États clés**
+- `smalltalk_intro`
+- `discovery`
+- `quota_blocked`
+
+**Règle**
+- `resolve_state(ctx)` produit une décision avec :
+  - `state`
+  - `fastpath_allowed` (bool)
+  - `quota_blocked` (bool)
+  - `transition_window` / `transition_reason` (facultatif)
+
+**Gates**
+- `apply_gates(ctx)` applique les règles business non négociables (ex: warning soft paywall).
+
+---
+
+### 3) Fastpath (v0) — plans figés, low-risk
+
+Quand `fastpath_allowed = true`, on ne demande pas à l’orchestrator de “réinventer le plan”.
+On génère un plan **déterministe** :
+
+- `A: tool.db_load_context` (light)
+- (optionnel) `S: tool.docs_chunks` (uniquement si docs nécessaires)
+- `D: agent.response_writer`
+
+But : **stabilité**, latence basse, moins de surface de bug.
+
+---
+
+### 4) Discovery — règles de statut et séquence AHA
+
+Discovery est pilotée par `public.user_settings.discovery_status`.
+
+**États autorisés**
+- `to_do` (par défaut)
+- `pending` (la séquence est engagée : on envoie la mini-démo)
+- `complete` (validé)
+- `aborted` (user a dit non)
+
+**Transitions (source de vérité = flags du message Lisa)**
+- Quand Lisa **POSE** la question de démo → `aha_request=true`
+  - Backend : `discovery_status` passe de `to_do` → `pending`
+- Quand Lisa **TERMINE** la mini-démo → `aha_moment=true`
+  - Backend : `discovery_status` passe → `complete` + `discovery_completed_at=now()`
+- Si user refuse → `onboarding_abort=true`
+  - Backend : `discovery_status` passe → `aborted` (sauf si déjà complete)
+
+**Important**
+- Les flags `aha_request / aha_moment / onboarding_abort` :
+  - ne doivent **jamais** être stockés dans `conversation_messages.content`
+  - sont **strippés** avant persistance (via `extract_and_clean_message_flags`)
+  - sont stockés en metadata : `provider.flags`
+
+---
+
+### 5) Docs (RAG light) — règle stricte : seulement quand utile
+
+**Objectif**
+- Injecter de la doc produit uniquement quand ça apporte quelque chose, sans polluer les échanges trivials.
+
+**Source**
+- `ctx.docs.scopes_all` = liste des scopes disponibles (ex: `discovery.value_proposition`, etc.)
+
+**Règle de sécurité**
+- Le ResponseWriter ne reçoit des docs **que** lorsque `discovery_status == 'pending'`.
+- Pas de docs pour “poser la question AHA” (intent `aha_request`) : docs inutiles à ce moment.
+
+**Sélection de scopes (discovery)**
+- On choisit **exactement 2 scopes** :
+  1) `discovery.value_proposition` (toujours)
+  2) `discovery.<agent_key>` si un seul agent actif et scope existant, sinon `discovery.default_all_profiles`
+
+Implémentation : `_pick_discovery_doc_scopes(ctx)`
+
+---
+
+### 6) Plan “Discovery Pending” (v1) — stable et tracé
+
+Quand `discovery_status == pending`, le plan exécuté est :
+
+- `A: tool.db_load_context` (medium possible via orchestrator, sinon light)
+- `B: tool.quota_check`
+- `S: tool.docs_chunks` (scopes sélectionnés)
+- `D: agent.response_writer` (intent = `discovery_pending`)
+
+Le log doit montrer :
+- `chat.docs_chunks.db` avec `rows_count > 0`
+- `chat.response_writer.docs_chunks` avec `dc_ok=true`
+
+---
+
+### 7) Ce qu’on accepte “imparfait” (pour avancer vite)
+
+- Le style de la phrase d’ouverture Discovery peut être perfectible.
+  - Cause connue : contrainte prompt “1 phrase d’ouverture personnalisée”.
+  - On bétonnera après plusieurs runs.
+- On privilégie :
+  - la stabilité du flow,
+  - la bonne transition des statuts,
+  - la bonne injection docs uniquement en pending,
+  - la traçabilité par logs.
+
+---
+
+---
+
+## 🔒 Contrat de déclenchement — States & Flags (v1)
+
+Cette section décrit **quand** chaque state / flag doit s’activer.
+👉 Source of truth : `ctx` (chargé par context_loader) + `resolve_state()` + `apply_gates()`.
+
+---
+
+### A) `state = smalltalk_intro`
+
+**Déclenchement (conditions minimales)**
+- `ctx.gates.smalltalk_intro_eligible (derived)== true`
+
+**Intuition**
+- L’utilisateur n’a pas encore “le socle minimum” (facts manquants), donc on privilégie une intro guidée.
+
+**Effets**
+- `mode = "smalltalk_intro"`
+- `intent = "smalltalk_intro"`
+- `context_level` forcé à `light` (pas besoin de charger le monde entier)
+- Pas d’injection docs / web (sauf évolution future explicitement décidée)
+
+**Override (même si eligible)**
+- Si `resolve_state()` détecte un état prioritaire (ex: `quota_blocked`) → smalltalk_intro saute.
+- (Option future) urgences / questions sensibles peuvent bypass l’intro.
+
+---
+
+### B) `state = discovery`
+
+**Déclenchement**
+- `ctx.settings.discovery_status` ∈ {`"pending"`, `"to_do"`} **ET** règles de sequencing discovery satisfaites
+  - Dans notre flow actuel : on entre en discovery dès qu’on a basculé dans la séquence (pending ou forced)
+
+**Règle importante**
+- `discovery_status == "pending"` ⇒ intent final attendu côté writer : `discovery_pending`
+- `discovery_status != "pending"` (ex: `to_do`) ⇒ intent final attendu : `discovery` (question AHA / cadrage)
+
+**Effets**
+- `mode = "discovery"`
+- Le plan peut inclure `docs_chunks` **uniquement** si on est en `pending` (cf. section “Docs gating”).
+
+---
+
+### C) `state = quota_blocked`
+
+**Déclenchement**
+- `ctx.user_status.free_quota_used >= ctx.user_status.free_quota_limit`
+  - Exemple : limit=8 → blocked à partir de 8 (ou +)
+
+**Effets**
+- `mode = "paywall"`
+- intent typique : `quota_blocked`
+- Le ResponseWriter doit produire une réponse courte + UX paywall (selon conventions front).
+
+---
+
+### D) `fastpath_allowed`
+
+**Déclenchement**
+- `resolve_state()` positionne `fastpath_allowed=true` **uniquement** sur des états “low risk” :
+  - `smalltalk_intro`
+  - `quota_blocked`
+  - (éventuellement) `discovery` si on décide de le rendre déterministe plus tard
+
+**Effet**
+- On n’appelle pas l’orchestrator.
+- On construit un plan stable (A → (S?) → D).
+
+---
+
+## 🧩 Flags / Decisions secondaires (v1)
+
+### 1) `soft_paywall_warning`
+
+**Déclenchement**
+- `apply_gates(ctx).soft_paywall_warning == true`
+- Cas typique :
+  - user non-pro
+  - `free_quota_used == free_quota_limit - 1`
+  - Exemple : limit=8 → warning à used=7
+
+**But**
+- Prévenir **sans bloquer** (message “dernier message gratuit” / warning soft).
+
+**Effet**
+- Transmis au ResponseWriter via `inputs.soft_paywall_warning`
+- N’impacte pas le state (on peut être en discovery/smalltalk/normal avec warning).
+
+---
+
+### 2) `transition_window` + `transition_reason`
+
+**Déclenchement**
+- `resolve_state()` met `transition_window=true` quand on est dans une zone où :
+  - l’utilisateur est en train de changer de phase,
+  - et on veut “aider la transition” (ex: bascule onboarding → normal, ou activation agent → reprise).
+- `transition_reason` est une string courte explicative (debug + guidance writer).
+
+**But**
+- Aider Lisa à être fluide (“OK, on passe à…”), sans que le LLM invente une logique.
+
+**Effet**
+- Transmis au ResponseWriter :
+  - `inputs.transition_window`
+  - `inputs.transition_reason`
+
+---
+
+### 3) `need_web`
+
+**Déclenchement**
+- Décidé par l’orchestrator (LLM) **ou** forcé par règles futures.
+- v1 : si `need_web=true` alors le plan inclut un node `tool.web_search`.
+
+**Règle**
+- En fastpath : `need_web=false` (forcé)
+
+---
+
+## 🏁 Flags fin de message (Discovery AHA)
+
+Ces flags sont **écrits dans la sortie brute du ResponseWriter** puis **strippés** avant persistance.
+
+### `aha_request=true`
+**Déclenchement**
+- Quand Lisa pose la question “mini-démo / AHA” (le moment où elle demande l’autorisation/validation).
+
+**Effet DB**
+- Backend met `user_settings.discovery_status = 'pending'`
+  - seulement si status précédent ∈ {`to_do`, `""`, NULL}
+
+---
+
+### `aha_moment=true`
+**Déclenchement**
+- Quand le user a répondu “oui” et que Lisa a effectivement produit la mini-démo (moment “OK c’est bon, on passe à la suite”).
+
+**Effet DB**
+- Backend met :
+  - `discovery_status = 'complete'`
+  - `discovery_completed_at = now()`
+
+---
+
+### `onboarding_abort=true`
+**Déclenchement**
+- Quand le user refuse explicitement la mini-démo.
+
+**Effet DB**
+- Backend met `discovery_status = 'aborted'`
+  - sauf si déjà `complete`
+
+---
+
+## 📌 Docs gating (règle non négociable)
+
+**Le ResponseWriter ne reçoit `docs_chunks` que si :**
+- `ctx.settings.discovery_status == 'pending'`
+
+**Donc :**
+- Pas de docs si intent = “poser la question AHA” (`aha_request`)
+- Docs uniquement pendant l’exécution de la séquence `discovery_pending`
+
+---
+
+
+---
+
+## 🧭 Onboarding State (v1) — Déterministe & Global
+
+Onboarding est un state dominant déclenché uniquement si :
+
+- has_paid_active == true
+- ET onboarding_target != none
+- ET discovery_status == "complete"
+
+👉 Onboarding ne peut jamais coexister avec Discovery.
+👉 Quota / paywall ne jouent aucun rôle dans le state machine.
+
+---
+
+### 🎯 Objectif Onboarding
+
+Deux axes :
+
+1. Compréhension capacités (ce que Lisa peut / ne peut pas faire)
+2. Contexte minimum pour être pertinente
+
+---
+
+## 🧠 Modèle global
+
+Table dédiée : `public.user_onboarding`
+
+Champs clés :
+
+- level_max: none | personal | pro  
+  (pro est terminal, jamais downgradé)
+
+- target: personal | pro | null  
+  (null = pas d’onboarding actif)
+
+- status: started | complete | null
+
+- user_msgs_since_started: int  
+  (compteur déterministe, reset à chaque completion)
+
+---
+
+## 🧩 Calcul déterministe de onboarding_target
+
+À chaque tour :
+
+1) Si discovery_status != complete → target = null
+2) Sinon si has_paid_active == false → target = null
+3) Sinon si level_max == 'pro' → target = null
+4) Sinon si has_pro_mode_active == true → target = 'pro'
+5) Sinon → target = 'personal'
+
+---
+
+## ✅ Completion Rules
+
+### 🔹 Onboarding Personal
+
+Condition unique :
+
+- user_msgs_since_started > 10
+
+→ level_max = personal  
+→ status = complete  
+→ user_msgs_since_started = 0
+
+---
+
+### 🔹 Onboarding Pro
+
+Complete si l’un des cas suivants :
+
+- action_request_detected == true
+- OR connected_tools_count >= 1
+- OR fallback : user_msgs_since_started > 10
+
+→ level_max = pro (terminal)  
+→ status = complete  
+→ user_msgs_since_started = 0
+
+---
+
+## 🔁 Reset Logic
+
+Le compteur user_msgs_since_started est utilisé pour personal ET pro.
+
+Il doit être remis à 0 :
+
+- quand onboarding personal passe complete
+- quand onboarding pro passe complete
+
+---
+
+## 🔍 Données nécessaires (Context Loader)
+
+Les champs suivants doivent être disponibles dans ctx.gates :
+
+- has_paid_active  
+  = (user_status.is_pro == true)
+
+- has_pro_mode_active  
+  = EXISTS (
+        SELECT 1 FROM lisa_user_agents
+        WHERE user_id = ...
+        AND status = 'active'
+        AND agent_key != 'personal_assistant'
+    )
+
+- connected_tools_count  
+  = EXISTS (
+        SELECT 1 FROM lisa_user_integrations
+        WHERE user_id = ...
+    )
+
+⚠️ Important :
+Même si un user déconnecte un tool, sa présence historique dans lisa_user_integrations suffit à valider connected_tools_count.
+
+---
+
+## 🏁 Priority Order (State Resolver)
+
+1. onboarding
+2. smalltalk_intro
+3. discovery
+4. ongoing_pro
+5. ongoing_personal (fallback)
+
+Impossible d’avoir un user sans state.
+
+
+⚡ Fastpath / Orchestrator Split (v1) — Architecture d’Escalade Déterministe
+
+Le moteur de conversation repose sur un double chemin contrôlé :
+	1.	Fastpath (réponse rapide)
+	2.	Orchestrator (planification complète)
+
+L’objectif :
+→ Minimiser la latence quand possible
+→ Garantir cohérence state machine quand nécessaire
+
+⸻
+
+🧭 Router Global
+
+Le Router décide du provider primaire :
+	•	"fastpath"
+	•	"orchestrator"
+
+Ce choix est effectué avant l’appel au ResponseWriter.
+
+⸻
+
+⚡ Fastpath — Règle stricte
+
+Le fastpath est utilisé uniquement pour des cas simples :
+	•	small_talk
+	•	amabilities
+	•	general_question
+
+Il fournit :
+	•	contexte minimal
+	•	10 derniers messages
+	•	aucun plan
+	•	aucun tool complexe
+
+⚠️ Le fastpath n’interprète pas le state machine.
+⚠️ Il ne décide pas d’intent.
+⚠️ Il ne fait aucune orchestration.
+
+⸻
+
+🧠 ResponseWriter (Lisa) — Responsabilité exacte
+
+Lisa ne route pas.
+
+Elle fait uniquement :
+	1.	Produire une réponse.
+	2.	OU déclencher une escalade déterministe.
+
+Elle n’appelle jamais l’orchestrator elle-même.
+
+⸻
+
+🚨 Escalade Déterministe (Fastpath uniquement)
+
+Si Lisa estime que :
+	•	la demande ne correspond pas strictement à
+small_talk / amabilities / general_question
+	•	OU que le contexte est insuffisant
+	•	OU que la demande nécessite une logique plus complexe
+
+[[ESCALATE]]
+
+🔒 Sécurité Anti-Dérive
+
+Règle absolue :
+
+Si la chaîne [[ESCALATE]] apparaît N’IMPORTE OÙ dans la réponse du LLM
+→ escalade immédiate.
+
+Même si le LLM a ajouté du texte autour.
+
+Aucune heuristique.
+Aucune interprétation.
+Aucun motif.
+
+⸻
+
+🔁 Cycle d’Escalade
+	1.	Fastpath appelle ResponseWriter
+	2.	ResponseWriter renvoie [[ESCALATE]]
+	3.	PlanExecutor retourne { escalate: true }
+	4.	chat.py relance automatiquement l’orchestrator
+	5.	L’orchestrator choisit l’intent correct
+	6.	Exécution complète avec plan + tools
+
+⚠️ Important :
+Escalade possible uniquement si route_source == fastpath.
+
+L’orchestrator ne peut jamais escalader.
+Donc aucune boucle infinie possible.
+
+⸻
+
+🧱 Séparation des Responsabilités
+
+Router
+
+Décide du provider primaire.
+
+Fastpath
+
+Réponse rapide, aucun raisonnement complexe.
+
+Orchestrator
+	•	Résout le state
+	•	Détermine l’intent
+	•	Prépare le plan
+	•	Injecte tools/context/web/docs
+
+ResponseWriter
+	•	Génère la réponse
+	•	OU déclenche l’escalade
+	•	Ne fait aucune logique métier
+
+⸻
+
+🛡️ Garanties Architecture
+	•	Pas de boucle possible
+	•	Pas de double routage
+	•	Pas d’auto-réinjection
+	•	Pas d’ambiguïté de responsabilité
+	•	Escalade déterministe
+	•	State machine centralisée dans orchestrator
+
+⸻
+
+🧠 Résumé Conceptuel
+
+Fastpath = Optimisation
+Orchestrator = Intelligence
+ResponseWriter = Production
+Escalade = Garde-fou
+
+🗺️ Diagramme Global — Flow Conversationnel
+
+                    ┌────────────────────┐
+                    │    USER MESSAGE     │
+                    └─────────┬──────────┘
+                              │
+                              ▼
+                    ┌────────────────────┐
+                    │       ROUTER        │
+                    │  (choix provider)   │
+                    └───────┬───────┬────┘
+                            │       │
+                 fastpath ──┘       └── orchestrator ---------
+                            │                                 |
+                            ▼								  |
+                ┌────────────────────┐						  |
+                │  RESPONSE WRITER   │						  |
+                │       (Lisa)       │						  |
+                └───────┬────────────┘						  |
+                        │									  |
+         ┌──────────────┴──────────────┐					  |
+         │                             │				      |
+         ▼                             ▼					  |
+   Réponse normale              [[ESCALATE]]				  |
+         │                             │					  |	
+         ▼                             ▼					  |
+      USER                     ┌────────────────────┐		  |
+                               │   PLAN EXECUTOR    │		  |
+                               └─────────┬──────────┘		  |
+                                         │ escalate:true	  |
+                                         ▼					  |
+                               ┌────────────────────┐		  |
+                               │   ORCHESTRATOR     │_________|
+                               │  (intent + plan)   │		 
+                               └─────────┬──────────┘		 
+                                         │
+                                         ▼
+                               ┌────────────────────┐
+                               │   PLAN EXECUTOR    │
+                               └─────────┬──────────┘
+                                         │
+                                         ▼
+                               ┌────────────────────┐
+                               │  RESPONSE WRITER   │
+                               │     (orchestr.)    │
+                               └─────────┬──────────┘
+                                         │
+                                         ▼
+                                       USER
+
+
+🧠 Garanties Structurelles
+	•	Escalade possible uniquement si provider == fastpath
+	•	Orchestrator ne peut jamais escalader
+	•	Donc aucune boucle infinie
+	•	State machine centralisée uniquement dans orchestrator
+	•	Fastpath = optimisation, jamais décisionnel profond
+
+
+# Registry
+USER_BLOCKS_BY_INTENT: Dict[str, UserPromptBlock] = {
+    "smalltalk_intro": SMALLTALK_INTRO,
+    "discovery": DISCOVERY,
+    "discovery_pending": DISCOVERY_PENDING,
+    "onboarding": ONBOARDING,
+    "action_request": ACTION_REQUEST,
+    "functional_question": FUNCTIONAL_QUESTION,
+    "general_question": GENERAL_QUESTION,
+    "paywall_soft_warning": PAYWALL_SOFT_WARNING,
+    "small_talk": SMALL_TALK,
+}

@@ -16,9 +16,6 @@ from app.agents.node_registry import (
 
 
 IntentType = Literal[
-    "smalltalk_intro",
-    "discovery",
-    "onboarding",
     "small_talk",
     "amabilities",
     "functional_question",
@@ -32,15 +29,27 @@ IntentType = Literal[
     "urgent_request",
 ]
 
+StateType = Literal[
+    "smalltalk_intro",
+    "discovery",
+    "discovery_pending",   # ✅ AJOUTER
+    "onboarding",
+    "ongoing_personal",
+    "ongoing_pro",
+]
+
 ContextLevel = Literal["light", "medium", "max"]
 MANDATORY_DISCOVERY_SCOPE = "discovery.value_proposition"
 DOCS_SCOPES_MAX = 5
+
+
 
 # NOTE: v1 — plan minimal : P1 parallel [context + quota] puis response_writer
 @dataclass
 class OrchestratorResult:
     ok: bool
     language: str
+    state: StateType
     intent: IntentType
     context_level: ContextLevel
     need_web: bool
@@ -48,6 +57,7 @@ class OrchestratorResult:
     confidence: float
     plan: Dict[str, Any]
     debug: Dict[str, Any]
+    
 
 
 
@@ -60,91 +70,26 @@ CONTEXTE LISA
 Lisa accompagne l'utilisateur dans sa vie personnelle et professionnelle.
 
 Modes disponibles :
-- Assistante Personnelle (actuel) : conseil, aide décision, accompagnement. N'exécute PAS d'actions (réservations, emails...).
+- Assistante Personnelle: conseil, aide décision, accompagnement. N'exécute PAS d'actions (réservations, emails...).
 - Ultimate Assistant (payant) : exécution actions concrètes (agenda, emails, réservations, finances).
 - Modes Pro (payant, selon métier) : Assistante Médicale, Assistant Airbnb, etc.
 
-Quota freemium : 8 messages gratuits (lifetime). Au-delà : paywall.
-
 ═══════════════════════════════════════════════════════════════
-INTENTS (classification exhaustive)
+STATE (SOURCE DE VÉRITÉ — DÉTERMINISTE)
 
-smalltalk_intro
+Le backend fournit: ctx.runtime_state.state ∈
+(smalltalk_intro, discovery, onboarding, ongoing_personal, ongoing_pro)
 
-→ Small talk de connexion strict pour collecter les facts minimum (tu/vous, prénom, ville, activité).
-→ Actif seulement si quota OK ET facts minimum incomplets.
-→ Au niveau orchestrator : tu actives le mode via inputs vers response_writer.
-→ level=light
+RÈGLE ABSOLUE:
+- Tu ne choisis PAS le state.
+- Tu choisis uniquement l'intent (liste ci-dessous) en tenant compte du state.
+- En sortie, tu dois renvoyer:
+- intent ∈ {{small_talk, amabilities, functional_question, general_question, decision_support,
+             motivational_guidance, action_request, deep_work, professional_request,
+             sensitive_question, urgent_request}}
+  - context_level, need_web, scopes si nécessaire.
 
-RÈGLE SMALLTALK_INTRO (DÉTERMINISTE)
-Si ctx.user_status.is_pro = false
-ET ctx.user_status.state != "blocked"
-ET ctx.user_status.free_quota_used < ctx.user_status.free_quota_limit
-ET ctx.user_facts.missing_required_count > 0
-ALORS intent = smalltalk_intro
-SAUF si le dernier message utilisateur est manifestement hors phase d’intro
-(ex: question produit, demande urgente, sujet sensible, etc.).
-
-⸻
-
-discovery
-
-→ Phase de découverte guidée (présentation + cadrage) : “qu’est-ce que Lisa peut faire pour moi ?”
-→ level=light
-
-RÈGLE PRIORITAIRE (DÉTERMINISTE — cas forcé)
-Si ctx.gates.discovery_forced = true ET ctx.gates.discovery_status != "complete"
-ALORS intent = discovery (peu importe le message utilisateur)
-SAUF si l’intent doit être urgent_request ou sensitive_question.
-
-RÈGLE NON CONTRAINTE (LIBRE ARBITRE — exploration du champ des possibles)
-Même si ctx.gates.discovery_forced = false, tu peux choisir intent=discovery si :
-	•	l’utilisateur explore de façon vague le champ des possibles (“tu peux faire quoi pour moi”, “comment tu peux m’aider”, “par où commencer”, “je veux voir ce que tu sais faire”),
-	•	OU l’utilisateur poursuit naturellement la séquence de découverte initiée (ex: après une réponse discovery, il demande “ok et ensuite ?”, “donne-moi des exemples”, “quels cas d’usage ?”).
-
-Distinction clé vs functional_question
-	•	discovery = exploration large / intention floue / cadrage global / “quoi pour moi ? / gibberish/test clavier (“jhgfsghdjs”, “aaaaa”, etc.) ”
-	•	functional_question = question précise sur une fonctionnalité, une règle, un pricing, un aspect RGPD/CGV, etc.
-
-RÈGLES DOCUMENTATION (Discovery)
-	•	scope_need = true
-	•	Tu DOIS sélectionner 1 à 5 scopes max dans “DOCUMENTATION DISPONIBLE (SCOPES EXACTS)”
-	•	scopes_selected = liste de strings
-	•	Si aucun scope pertinent : scope_need=false et scopes_selected=[]
-    •	Scope obligatoire dès que discovery actif ou toute question qui permet de chosiir la meilleure offre HeyLisa par profil = "discovery.value_proposition"
-
-⸻
-
-onboarding 
-
-→ Phase d’onboarding après activation d’un mode payant (Personal / Ultimate / Mode Pro).
-→ Objectif : aider l’utilisateur à prendre la main sur le service qu’il vient de payer (setup, cadrage, premières actions, connexions).
-→ level=medium (ou max si mode Pro sensible type médical)
-
-Déclencheurs / Signaux forts
-	•	Message proactif de Lisa post-paiement (“merci / bienvenue / on configure”)
-	•	L’utilisateur demande “on commence”, “comment on setup”, “je veux connecter X”, “explique-moi le process”, “quelles infos tu as besoin”
-	•	Les échanges sont centrés sur : setup, permissions, connexions, règles, préférences, workflow de démarrage, checklist.
-
-RÈGLE DE CONTINUITÉ (dynamique)
-Tant que la conversation reste dans la dynamique du 1er message post paiement (guidage setup), tu restes en onboarding.
-Même si Lisa pose des questions (“combien de personnes”, “à qui je reporte”, etc.), ce n’est pas du smalltalk, c’est de l’onboarding.
-
-Source de vérité (backend attendu)
-Tu utilises ctx.onboarding (ou équivalent) dès qu’il existe.
-	•	ctx.onboarding.status ∈ (pending,started,complete)
-	•	ctx.onboarding.active_agent_mode (ex: ultimate, medical, airbnb)
-	•	ctx.onboarding.started_at
-
-Sortie déterministe “complete” (logique attendue côté backend)
-	•	Si mode = personal_assistant : complete si l’utilisateur réécrit spontanément >48h après started_at.
-	•	Si mode = ultimate ou pro : complete dès qu’au moins un des événements arrive après paiement :
-	1.	une demande d’action réalisée (action_request)
-	2.	une intégration connectée / permission validée
-
-Tant que ctx.onboarding.status == started et pas complete, l’intent onboarding doit être fortement favorisé (sauf urgence/sensible).
-
-⸻
+INTENTS & GRILLE DE SÉLECTION : 
 
 small_talk
 
@@ -173,7 +118,16 @@ functional_question
 → Signaux : “Comment tu organises les mails ?”, “Je clique où pour ouvrir l'espace Deep Work ?”, “RGPD ?”, “Je veux supprimer mon compte”
 → level=medium
 
-Distinction : si l’utilisateur est en exploration vague “quelles sont tes fonctionnalités ?”, c’est discovery, pas functional_question.
+📚 RÈGLE DOCS (OBLIGATOIRE)
+- Si intent=functional_question :
+  - scope_need = true (toujours)
+  - scopes_selected = 1 à 5 scopes EXACTS (jamais 0), choisis uniquement dans la liste "DOCUMENTATION DISPONIBLE (SCOPES EXACTS)".
+  - Objectif: charger les chunks les plus pertinents pour répondre précisément.
+- Si tu ne trouves pas de scope pertinent dans la liste, tu mets:
+  - scope_need = false
+  - scopes_selected = []
+  (mais c’est un cas exceptionnel)
+
 
 ⸻
 
@@ -196,8 +150,25 @@ decision_support
 motivational_guidance
 
 → Motivation / soutien / perspective / recadrage.
-→ Signaux : “Je suis découragé”, “J’ai besoin de motivation”, “Pourquoi continuer ?”
+→ Cible : état intérieur + clarté + énergie, pas “choisir entre A et B”.
 → level=max
+
+✅ Déclencheurs explicites :
+- “Je suis découragé”, “J’ai besoin de motivation”, “Pourquoi continuer ?”
+- “J’en peux plus”, “Je suis vidé”, “Je suis perdu”, “J’ai plus envie”
+- “Je sais pas pourquoi je fais ça”, “Je suis en vrac”, “Je doute de tout”
+
+✅ Signaux faibles (IMPORTANT : souvent indirects) :
+- baisse d’énergie (“fatigué”, “épuisé”, “ça me saoule”, “j’ai la flemme”, “je procrastine”)
+- perte de sens (“à quoi bon”, “je tourne en rond”, “je stagne”, “ça sert à rien”)
+- auto-pression / sur-contrôle (“il faut que…”, “je dois…”, “j’ai pas le droit de…”)
+- rumination / confusion (“je sais pas”, “je suis bloqué”, “je suis perdu”, “je pars dans tous les sens”)
+- tension émotionnelle (“je suis énervé”, “ça m’angoisse”, “j’ai la boule au ventre”)
+- doute identitaire (“je suis pas fait pour ça”, “je suis nul”, “j’y arriverai pas”)
+
+⚠️ Règle clé :
+Si l’utilisateur exprime un état interne (fatigue, doute, perte de sens, stress) même sans demander “motivation”,
+→ préférer motivational_guidance à decision_support.
 
 ⸻
 
@@ -211,9 +182,26 @@ action_request
 
 deep_work
 
-→ Travail approfondi : analyse, synthèse, dev, rédaction, recherche complexe.
-→ Signaux : “Analyse ce document”, "travaillon sur mon mémoire", “Synthèse de…”, “Recherche tout sur…”, “écris / code…”
+→ Travail structuré et approfondi impliquant production, analyse longue ou livrable formel.
 → level=medium (ou max si lié aux projets/contraintes de l’utilisateur)
+
+Déclencheurs typiques :
+- analyse / synthèse d’un document (PDF, Word, Excel…)
+- travail sur mémoire, thèse, dossier, business plan
+- rédaction longue structurée (plan détaillé, stratégie complète)
+- préparation d’examen ou coaching académique
+- dev / code / debug / architecture technique
+- projet nécessitant plusieurs étapes ou allers-retours
+
+Règle clé :
+Si la demande implique un livrable structuré, plusieurs itérations,
+ou dépasse une réponse exploitable en quelques paragraphes,
+→ choisir deep_work.
+
+Ne PAS choisir deep_work si :
+- simple question d’information (→ general_question)
+- arbitrage entre options (→ decision_support)
+- soutien émotionnel (→ motivational_guidance)
 
 ⸻
 
@@ -222,7 +210,6 @@ professional_request
 → Demande liée à un métier / cadre pro spécifique (dossier client/patient, cabinet, Airbnb ops).
 → Signaux : “Mon patient…”, “Dossier client…”, “Réservation Airbnb…”
 → level=max
-→ Si mode pro absent : proposer activation du mode correspondant.
 
 ⸻
 
@@ -236,17 +223,54 @@ sensitive_question
 
 urgent_request
 
-→ Urgence, panique, stress aigu, besoin immédiat.
-→ Signaux : “Urgent”, “Je panique”, “Là maintenant”, “Critique”
-→ level=medium 
+→ Situation critique impliquant un danger immédiat ou une détresse grave.
+→ level=max
+
+🚨 Déclencheurs explicites :
+- Idées suicidaires ou auto-agressives (“je veux en finir”, “je ne veux plus vivre”, “je pense à me faire du mal”)
+- Danger immédiat (“je vais faire une bêtise”, “je suis en danger”, “on me menace”)
+- Symptômes médicaux graves en cours (perte de conscience, douleur thoracique intense, difficulté respiratoire aiguë)
+- Panique incontrôlable avec perte de contrôle
+
+⚠️ Important :
+Le mot “urgent” seul ne suffit PAS.
+Le stress, la pression professionnelle, l’anxiété légère, un délai court,
+ne déclenchent PAS urgent_request.
+
+Si l’urgence est psychologique légère ou liée à un choix,
+→ utiliser motivational_guidance ou decision_support.
 
 ⸻
 
-Priorité si ambiguïté
+PRIORITÉ SI AMBIGUÏTÉ
 
-urgent_request > sensitive_question > onboarding > professional_request > decision_support >
-action_request > functional_question > general_question > motivational_guidance >
-discovery > small_talk > amabilities
+sensitive_question > urgent_request > professional_request > decision_support >
+action_request > functional_question > motivational_guidance > general_question >
+small_talk > amabilities
+
+DÉSAMBIGUÏSATION DECISION_SUPPORT vs MOTIVATIONAL_GUIDANCE
+
+- decision_support = l’utilisateur veut choisir entre options (A/B), décider, trancher, comparer, arbitrer.
+  Indices : “quelle option”, “je choisis quoi”, “dois-je”, “j’hésite entre”, “lequel est mieux”, “avantages/inconvénients”.
+
+- motivational_guidance = l’utilisateur est en baisse d’énergie / sens / confiance, ou décrit une tension interne
+  même s’il mentionne une décision.
+  Indices : fatigue, découragement, anxiété, perte de sens, auto-pression, confusion, rumination.
+
+Règle de tie-break :
+Si un message contient à la fois (1) une décision et (2) un signal interne de fatigue/doute/stress,
+→ choisir motivational_guidance (stabiliser d’abord), sauf si l’utilisateur demande explicitement “choisis pour moi entre A et B”.
+
+DÉSAMBIGUÏSATION URGENT_REQUEST
+
+- urgent_request = danger vital, crise psychologique grave, santé préoccupante immédiate.
+- sensitive_question = question santé/finance/juridique sans danger immédiat.
+- motivational_guidance = détresse émotionnelle non critique.
+- decision_support = pression décisionnelle, même “urgente”.
+
+Règle :
+Si aucun danger immédiat ou risque vital n’est détecté,
+→ ne PAS choisir urgent_request.
 
 ═══════════════════════════════════════════════════════════════
 WEB SEARCH (need_web)
@@ -267,6 +291,19 @@ web_search_prompt (strict si need_web=true) :
 - Privilégier sources fiables
 - Si need_web=true => web_search_prompt DOIT être non vide.
 Sinon web_search_prompt=null.
+
+Cas particulier : sensitve_question
+Quand intent = sensitive_question, tu DOIS te poser explicitement la question :
+“Est-ce que ma réponse dépend d’une règle officielle, d’un taux, d’une procédure, d’une obligation légale/fiscale, d’une démarche administrative, ou d’un fait susceptible d’avoir changé récemment ?”
+
+Si OUI → need_web = true, et web_search_prompt doit cibler des sources d’autorité.
+
+Si NON → need_web = false (ex: organisation, méthode, hygiène financière générale, checklist non réglementaire).
+
+🧱 Qualité attendue (obligatoire)
+- Si need_web=true : web_search_prompt 3–4 lignes max, inclut pays + contexte + termes officiels.
+- Sources prioritaires : gouvernement/administrations/organismes publics/textes officiels/ordres pro.
+- Si tu ne trouves pas de sources fiables : tu n’inventes pas. Tu le dis et recommandes une voie sûre.
 
 ═══════════════════════════════════════════════════════════════ ...
 
@@ -299,6 +336,53 @@ LANGUE
 - language = fr, en, es, de, it, pt, other
 - Si incertain: language="fr"
 
+═══════════════════════════════════════════════════════════════
+DOCS SCOPES POLICY (STRICT)
+
+Tu peux demander des docs via :
+- scope_need = true
+- scopes_selected = [ ... ] (1 à 5 scopes)
+
+Règles :
+1) Tu n’inventes JAMAIS de scopes. Tu choisis uniquement les plus pertinents pour le contexte dans "DOCUMENTATION DISPONIBLE (SCOPES EXACTS)".
+2) functional_question => scope_need = true OBLIGATOIRE et scopes_selected non vide (1..5), sauf si aucun scope pertinent n’existe.
+3) discovery => scope_need = true (déjà géré côté code) mais tu peux aussi proposer d’autres scopes pertinents.
+4) small_talk / amabilities => scope_need = false, scopes_selected = [].
+
+═══════════════════════════════════════════════════════════════
+
+🔒 PLAYBOOK DECISION MATRIX
+
+Tu dois déterminer playbook_need et playbook_level selon les règles suivantes :
+	1.	Si ctx.onboarding.status == “started”
+→ playbook_need = true
+→ playbook_level = “full”
+	2.	Sinon si ctx.onboarding.pro_mode == true ET intent in [“professional_request”, “action_request”]
+→ playbook_need = true
+→ playbook_level = “light”
+	3.	Sinon si ctx.onboarding.pro_mode == false ET intent == “action_request”
+→ playbook_need = true
+→ playbook_level = “light”
+	4.	Si ctx.gates.smalltalk_intro_eligible == true
+→ playbook_need = false
+	5.	Sinon
+→ playbook_need = false
+
+Tu ne choisis jamais la clé du playbook.
+La clé vient de ctx.onboarding.primary_agent_key.
+
+═══════════════════════════════════════════════════════════════
+ONBOARDING_PATCH (ÉCRITURE DB)
+
+Tu peux proposer un onboarding_patch UNIQUEMENT si ctx.runtime_state.state == "onboarding".
+
+Règles strictes :
+- onboarding_patch.should_write = true seulement si le message user apporte une info exploitable.
+- target doit être une string courte (ex: "personal", "business", "airbnb", "medical") ou null.
+- level_max doit être "light" | "medium" | "max" ou null.
+- metadata_patch = petit objet (max 10 clés). Pas de texte long. Pas de PII.
+- Si tu n'es pas sûr => should_write=false (et tout le reste null/{{}}).
+
 SORTIE: voir schéma.
 """
 
@@ -314,6 +398,16 @@ JSON_SCHEMA_HINT = {
 
   "scope_need": False,
   "scopes_selected": [],
+
+  "playbook_need": False,
+  "playbook_level": None,
+
+  "onboarding_patch": {
+    "should_write": False,
+    "target": None,
+    "level_max": None,
+    "metadata_patch": {}
+  },
 
   "plan":  {
         "nodes": [
@@ -359,6 +453,20 @@ def _language_from_ctx(ctx: Optional[Dict[str, Any]]) -> str:
     except Exception:
         pass
     return "fr"
+
+def _state_from_ctx(ctx: Optional[Dict[str, Any]]) -> str:
+    try:
+        s = ((ctx or {}).get("runtime_state") or {}).get("state")
+        s = str(s or "").strip()
+        return s
+    except Exception:
+        return ""
+
+def _normalize_state(s: str) -> StateType:
+    s = (s or "").strip()
+    if s in {"smalltalk_intro", "discovery", "discovery_pending", "onboarding", "ongoing_personal", "ongoing_pro"}:
+        return s  # type: ignore
+    return "ongoing_personal"
 
 def _render_docs_scopes_block(ctx: Optional[Dict[str, Any]]) -> str:
     """
@@ -478,28 +586,6 @@ def _compute_smalltalk_intro_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
         "missing_required": missing,
     }
 
-def _compute_discovery_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    gates = (ctx or {}).get("gates") or {}
-    return {
-        "discovery_forced": bool(gates.get("discovery_forced")),
-        "discovery_status": gates.get("discovery_status"),
-        "transition_window": bool(gates.get("transition_window")),
-        "transition_reason": gates.get("transition_reason"),
-    }
-
-def _compute_onboarding_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    ob = (ctx or {}).get("onboarding") or {}
-    status = ob.get("status")  # started|complete|None
-    pro_mode = bool(ob.get("pro_mode"))
-    agent_key = ob.get("primary_agent_key")
-    return {
-        "onboarding_status": status,
-        "pro_mode": pro_mode,
-        "primary_agent_key": agent_key,
-        "onboarding_active": (status == "started" and pro_mode),
-    }
-
-
 def _compute_capabilities(ctx: Dict[str, Any]) -> Dict[str, Any]:
     caps = (ctx or {}).get("capabilities") or {}
     # fallback si pas présent
@@ -519,26 +605,42 @@ def _apply_business_gates(
     confidence: float,
 ) -> Dict[str, Any]:
     """
-    Retourne:
-      - intent_final
-      - mode: "smalltalk_intro" | "normal"
-      - intent_eligible bool
-      - intent_block_reason str|None
-      - gates/capabilities pass-through
+    Orchestrator ne choisit PLUS de state.
+    Il choisit uniquement intent + applique:
+    - guardrails smalltalk_intro (ne pas "déraper" trop vite)
+    - capabilities gating (action/deep_work/pro_request)
     """
     gate = _compute_smalltalk_intro_gate(ctx)
     caps = _compute_capabilities(ctx)
-    discvr = _compute_discovery_gate(ctx)
-    discovery_forced = bool(discvr.get("discovery_forced"))
-    obg = _compute_onboarding_gate(ctx)
-    onboarding_active = bool(obg.get("onboarding_active"))
 
     eligible_intro = bool(gate["smalltalk_intro_eligible"])
     short_ack = _is_short_ack(user_message)
 
-    # 1) Overrides qui cassent l'intro (si explicitement détectés)
+    intent = (llm_intent or "general_question").strip()
+
+    # intents autorisés (safety net)
+    allowed = {
+        "small_talk",
+        "amabilities",
+        "functional_question",
+        "general_question",
+        "decision_support",
+        "motivational_guidance",
+        "action_request",
+        "deep_work",
+        "professional_request",
+        "sensitive_question",
+        "urgent_request",
+    }
+    if intent not in allowed:
+        intent = "general_question"
+
+    # Guardrail smalltalk_intro:
+    # si intro éligible, on laisse passer uniquement:
+    # - urgent/sensitive
+    # - ou un intent "fort" si confiance haute ET message pas juste un ack
     hard_overrides = {"urgent_request", "sensitive_question"}
-    soft_overrides = {
+    strong_intents = {
         "functional_question",
         "general_question",
         "decision_support",
@@ -548,60 +650,29 @@ def _apply_business_gates(
         "deep_work",
     }
 
-    intent = (llm_intent or "general_question").strip()
-
-    # 1) smalltalk_intro gate (prioritaire)
     if eligible_intro:
         if intent in hard_overrides:
-            mode = "normal"
             intent_final = intent
-        elif intent in soft_overrides and confidence >= 0.85 and not short_ack:
-            mode = "normal"
+        elif intent in strong_intents and confidence >= 0.85 and not short_ack:
             intent_final = intent
         else:
-            mode = "smalltalk_intro"
-            intent_final = "smalltalk_intro"
+            # pendant l’intro, on absorbe vers small_talk (pas "smalltalk_intro"!)
+            intent_final = "small_talk"
     else:
-        mode = "normal"
         intent_final = intent
 
-    # 2) Forced discovery (si discovery_forced et discovery pas complete)
-    #    Sauf urgences / sensible
-    if discovery_forced and intent_final not in {"urgent_request", "sensitive_question"}:
-        mode = "discovery"
-        intent_final = "discovery"
-
-    # 2bis) Forced onboarding (payant) si started + pro_mode
-    if onboarding_active and intent_final not in {"urgent_request", "sensitive_question"}:
-        mode = "onboarding"
-        intent_final = "onboarding"
-
-    # 3) Pendant intro: absorb amabilities/small_talk
-    if mode == "smalltalk_intro" and intent_final in {"amabilities", "small_talk"}:
-        intent_final = "smalltalk_intro"
-
-    # 4) Pendant discovery: absorb amabilities/small_talk aussi
-    if mode == "discovery" and intent_final in {"amabilities", "small_talk"}:
-        intent_final = "discovery"
-
-    if mode == "onboarding" and intent_final in {"amabilities", "small_talk"}:
-        intent_final = "onboarding"
-
-    # 4bis) Capabilities gating
+    # Capabilities gating
     intent_eligible = True
     block_reason = None
     if intent_final in {"action_request", "deep_work", "professional_request"}:
-        # tu as dit: dispo seulement si agent payant actif au-delà de personal_assistant
         if not caps.get("has_paid_agent"):
             intent_eligible = False
             block_reason = "AGENT_NOT_ACTIVE"
 
     return {
         "intent_final": intent_final,
-        "mode": mode,
         "intent_eligible": intent_eligible,
         "intent_block_reason": block_reason,
-        "discovery": discvr,
         "gates": gate,
         "capabilities": caps,
         "signals": {"short_ack": short_ack},
@@ -611,6 +682,7 @@ def _apply_business_gates(
 def _build_plan_minimal(
     *,
     language: str,
+    state: StateType,
     intent: str,
     mode: str,
     need_web: bool,
@@ -624,6 +696,16 @@ def _build_plan_minimal(
 
     scope_need: bool,
     scopes_selected: List[str],
+
+    playbook_need: bool,
+    playbook_level: Optional[str],
+    primary_agent_key: Optional[str],
+
+    # --- onboarding write (optionnel) ---
+    should_insert_onboarding_node: bool,
+    onboarding_target: Optional[str],
+    onboarding_level_max: Optional[str],
+    onboarding_metadata_patch: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
     Plan stable, peu risqué.
@@ -636,6 +718,19 @@ def _build_plan_minimal(
             "inputs": {"level": context_level or "medium"},
         },
     ]
+
+    if playbook_need and primary_agent_key:
+        nodes.append(
+            {
+                "id": "P",
+                "type": "tool.playbook_load",
+                "depends_on": ["A"],
+                "inputs": {
+                    "agent_key": primary_agent_key,
+                    "level": playbook_level or "light",
+                },
+            }
+        )
 
     # amabilities en mode normal => pas de quota_check
     if not (mode == "normal" and intent == "amabilities"):
@@ -664,6 +759,22 @@ def _build_plan_minimal(
             }
         )
 
+    # --- Onboarding write ---
+    # Node O : écrit target/level_max/metadata puis sync status started/complete
+    if should_insert_onboarding_node:
+        nodes.append(
+            {
+                "id": "O",
+                "type": "tool.onboarding_set_fields",
+                "depends_on": ["A"],
+                "inputs": {
+                    "target": onboarding_target,
+                    "level_max": onboarding_level_max,
+                    "metadata_patch": onboarding_metadata_patch or {},
+                },
+            }
+        )
+
     deps = ["A"]
 
     if any(n["id"] == "B" for n in nodes):
@@ -675,14 +786,20 @@ def _build_plan_minimal(
     if scope_need:
         deps.append("S")
 
+    if should_insert_onboarding_node:
+        deps.append("O")
+
+    if playbook_need and primary_agent_key:
+        deps.append("P")
+
     nodes.append(
         {
             "id": "D",
             "type": "agent.response_writer",
             "depends_on": deps,
             "inputs": {
+                "state": state,
                 "intent": intent,
-                "mode": mode,
                 "language": language,
                 "tone": "warm",
                 "need_web": need_web,
@@ -848,6 +965,7 @@ class OrchestratorAgent:
             return OrchestratorResult(
                 ok=False,
                 language=language,
+                state=_normalize_state(_state_from_ctx(ctx)),
                 intent=intent,
                 context_level=level,
                 need_web=False,
@@ -866,6 +984,7 @@ class OrchestratorAgent:
             return OrchestratorResult(
                 ok=False,
                 language="fr",
+                state=_normalize_state(_state_from_ctx(ctx)),
                 intent="general_question",
                 context_level="medium",
                 need_web=False,
@@ -874,8 +993,18 @@ class OrchestratorAgent:
                 plan=plan,
                 debug={"error": "INVALID_JSON_FROM_LLM", "meta": meta, "raw_llm": raw_llm},
             )
-
+        
+        state = _normalize_state(_state_from_ctx(ctx))
         language = _language_from_ctx(ctx)
+        primary_agent_key = None
+        try:
+            ob = (ctx or {}).get("onboarding") or {}
+            if isinstance(ob, dict):
+                primary_agent_key = ob.get("primary_agent_key")
+                if isinstance(primary_agent_key, str):
+                    primary_agent_key = primary_agent_key.strip() or None
+        except Exception:
+            primary_agent_key = None
         intent = data.get("intent") or "general_question"
         level = data.get("context_level") or "medium"
         confidence = float(data.get("confidence") or 0.0)
@@ -885,12 +1014,64 @@ class OrchestratorAgent:
 
         scope_need = bool(data.get("scope_need") or False)
 
+        # --- Escalation hints from fastpath (deterministic override) ---
+        try:
+            g = (ctx or {}).get("gates") or {}
+            force_need_web = bool(g.get("force_need_web") is True)
+            force_need_docs = bool(g.get("force_need_docs") is True)
+
+            if force_need_web:
+                need_web = True
+                # si pas de prompt, on le remplira plus bas via ton autofill guardrail
+
+            if force_need_docs:
+                scope_need = True
+        except Exception:
+            pass
+
+        ob = (ctx or {}).get("onboarding") or {}
+        ob_status = str(ob.get("status") or "").strip().lower()
+        ob_pro_mode = bool(ob.get("pro_mode") is True)
+        smalltalk_intro_eligible = bool(((ctx or {}).get("gates") or {}).get("smalltalk_intro_eligible"))
+
         raw_scopes = data.get("scopes_selected") or []
         scopes_selected: List[str] = []
         if isinstance(raw_scopes, list):
             for s in raw_scopes[:DOCS_SCOPES_MAX]:
                 if isinstance(s, str) and s.strip():
                     scopes_selected.append(s.strip())
+
+    
+        # --- Onboarding patch (optionnel, proposé par le LLM) ---
+        onboarding_patch = data.get("onboarding_patch") or {}
+        if not isinstance(onboarding_patch, dict):
+            onboarding_patch = {}
+
+        op_should_write = bool(onboarding_patch.get("should_write") is True)
+
+        op_target = onboarding_patch.get("target")
+        op_level_max = onboarding_patch.get("level_max")
+        op_metadata_patch = onboarding_patch.get("metadata_patch") or {}
+        if not isinstance(op_metadata_patch, dict):
+            op_metadata_patch = {}
+
+        # nettoyage soft
+        if isinstance(op_target, str):
+            op_target = op_target.strip()
+        else:
+            op_target = None
+
+        if isinstance(op_level_max, str):
+            op_level_max = op_level_max.strip()
+        else:
+            op_level_max = None
+
+        # règle hard: on write seulement en state=onboarding + should_write + au moins 1 champ exploitable
+        should_insert_onboarding_node = (
+            state == "onboarding"
+            and op_should_write
+            and bool(op_target or op_level_max or op_metadata_patch)
+        )
 
         # Règle 1: si scope_need=false => scopes_selected=[]
         if not scope_need:
@@ -909,16 +1090,36 @@ class OrchestratorAgent:
         )
 
         intent_final = gate_out["intent_final"]
-        mode = gate_out["mode"]
+
+        # matrice déterministe
+        playbook_need = False
+        playbook_level = None
+
+        if ob_status == "started":
+            playbook_need = True
+            playbook_level = "full"
+        elif (ob_pro_mode is True) and (intent_final in {"professional_request", "action_request"}):
+            playbook_need = True
+            playbook_level = "light"
+        elif (ob_pro_mode is False) and (intent_final == "action_request"):
+            playbook_need = True
+            playbook_level = "light"
+
+        # règle: si smalltalk intro, jamais de playbook
+        if smalltalk_intro_eligible:
+            playbook_need = False
+            playbook_level = None
+            
+        mode = state
         gates = gate_out["gates"]
 
         # --- Guardrail scopes: jamais pendant smalltalk (intro/soft/amabilities) ---
-        if mode in {"smalltalk_intro"} or intent_final in {"small_talk", "amabilities"}:
+        if state == "smalltalk_intro" or intent_final in {"small_talk", "amabilities"}:
             scope_need = False
             scopes_selected = []
 
         # --- Discovery: scope obligatoire "value_proposition" ---
-        if intent_final == "discovery":
+        if state == "discovery":
             scope_need = True
             scopes_selected = _ensure_mandatory_scope(
                 scopes_selected,
@@ -942,6 +1143,7 @@ class OrchestratorAgent:
         # --- Plan stable (on ignore le "plan" du LLM, trop risqué) ---
         plan = _build_plan_minimal(
             language=language or "fr",
+            state=state,
             intent=intent_final,
             mode=mode,
             need_web=need_web,
@@ -955,6 +1157,15 @@ class OrchestratorAgent:
 
             scope_need=scope_need,
             scopes_selected=scopes_selected,
+
+            playbook_need=playbook_need,
+            playbook_level=playbook_level,
+            primary_agent_key=primary_agent_key,
+
+            should_insert_onboarding_node=bool(should_insert_onboarding_node),
+            onboarding_target=op_target,
+            onboarding_level_max=op_level_max,
+            onboarding_metadata_patch=op_metadata_patch,
         )
 
         debug = data.get("debug") or {}
@@ -971,32 +1182,45 @@ class OrchestratorAgent:
         debug["intent_block_reason"] = intent_block_reason
         debug["scope_need"] = scope_need
         debug["scopes_selected"] = scopes_selected
+        debug["onboarding_should_write"] = bool(should_insert_onboarding_node)
+        debug["onboarding_patch_preview"] = {
+            "target": op_target,
+            "level_max": op_level_max,
+            "metadata_patch_keys": list((op_metadata_patch or {}).keys())[:20],
+        }
         debug["docs_scopes_count"] = int(((ctx or {}).get("docs") or {}).get("scopes_count") or 0)
 
         # --- Guardrails MINIMAUX (pas de correction d'intent) ---
 
-        # 1) low confidence => refuse (ok=false) + plan minimal safe
+        # 1) low confidence => on NE tue PAS le plan.
+        # On garde le plan déterministe construit (qui peut inclure web/docs).
+        # On signale juste pour debug + éventuellement analytics.
         if confidence < 0.80:
             debug["low_confidence_reason"] = debug.get("low_confidence_reason") or "confidence_below_0_80"
-            debug["fallback_used"] = True
-            plan = _fallback_plan_minimal(language or "fr")
-            return OrchestratorResult(
-                ok=False,
-                language=language or "fr",
-                intent=intent,
-                context_level="medium",
-                need_web=False,
-                web_search_prompt=None,
-                confidence=confidence,
-                plan=plan,
-                debug=debug,
-            )
+            debug["low_confidence_soft"] = True
 
         # 2) cohérence need_web
+        # Si need_web=true, on ne le désactive jamais ici.
+        # On génère un prompt minimal déterministe si le LLM a oublié de le fournir.
         if need_web and (not isinstance(web_search_prompt, str) or not web_search_prompt.strip()):
-            need_web = False
-            web_search_prompt = None
-            debug["web_prompt_missing"] = True
+            # pays via locale_main si dispo (ex: fr-FR -> FR)
+            locale_main = ""
+            try:
+                locale_main = str(((ctx or {}).get("settings") or {}).get("locale_main") or "")
+            except Exception:
+                locale_main = ""
+            country = (locale_main.split("-")[1] if "-" in locale_main else "").strip().upper()
+
+            web_search_prompt = (
+                f"{user_message}\n"
+                f"Contexte: utilisateur en {country or 'EU'}.\n"
+                f"Objectif: réponse exacte et à jour, avec sources fiables.\n"
+                f"Priorité: sources officielles / docs éditeurs / organismes reconnus."
+            )[:500]
+
+            debug["web_prompt_missing_autofilled"] = True
+
+        debug["web_final"] = {"need_web": need_web, "has_prompt": bool((web_search_prompt or "").strip())}
 
         # 3) amabilities => contraintes hard
         if intent_final == "amabilities":
@@ -1021,6 +1245,7 @@ class OrchestratorAgent:
             return OrchestratorResult(
                 ok=False,
                 language=language or "fr",
+                state=state,
                 intent="general_question",
                 context_level="medium",
                 need_web=False,
@@ -1033,6 +1258,7 @@ class OrchestratorAgent:
         return OrchestratorResult(
             ok=True,
             language=language or "fr",
+            state=state,
             intent=intent_final,
             context_level=level,
             need_web=need_web,

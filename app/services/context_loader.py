@@ -34,7 +34,7 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
     # 1) user identity
     user = await conn.fetchrow(
         """
-        select id, first_name, last_name, full_name
+        select id, first_name, last_name, full_name, coalesce(is_pro,false) as is_pro
         from public.users
         where id = $1
         """,
@@ -57,7 +57,7 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
                 coalesce(intro_smalltalk_done, false) as intro_smalltalk_done,
                 coalesce(free_quota_limit, 8) as free_quota_limit,
                 coalesce(free_quota_used, 0) as free_quota_used,
-                coalesce(discovery_status, 'pending') as discovery_status,
+                coalesce(discovery_status, 'to_do') as discovery_status,
                 discovery_completed_at as discovery_completed_at,
 
                 -- (si ces colonnes existent)
@@ -83,7 +83,7 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
                 coalesce(free_quota_limit, 8) as free_quota_limit,
                 coalesce(free_quota_used, 0) as free_quota_used,
 
-                coalesce(discovery_status, 'pending') as discovery_status,
+                coalesce(discovery_status, 'to_do') as discovery_status,
                 discovery_completed_at as discovery_completed_at
             from public.user_settings
             where user_id = $1
@@ -103,7 +103,7 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
             "free_quota_limit": 8,
             "free_quota_used": 0,
 
-            "discovery_status": "pending",
+            "discovery_status": "to_do",
             "discovery_completed_at": None,
 
             "main_city": None,
@@ -115,7 +115,7 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
         settings.setdefault("main_city", None)
         settings.setdefault("main_activity", None)
         settings.setdefault("use_tu_form", None)
-        settings.setdefault("discovery_status", "pending")
+        settings.setdefault("discovery_status", "to_do")
         settings.setdefault("discovery_completed_at", None)
 
     # 3) last messages (10) for this conversation
@@ -167,20 +167,55 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
             }
         )
 
-    # 3bis) user_status (source of truth quota)
+    # 3bis) user_status (source of truth db)
     qs = await get_quota_status(conn, str(public_user_id))
+
+    db_is_pro = False
+    try:
+        db_is_pro = bool(user.get("is_pro")) if user else False
+    except Exception:
+        db_is_pro = False
+
     user_status = {
-        "is_pro": bool(qs.is_pro),
+        # ✅ SOURCE DE VÉRITÉ: DB
+        "is_pro": db_is_pro,
+
+        # ✅ quota sert uniquement aux warnings / blocages / compteurs
         "free_quota_used": int(qs.used),
         "free_quota_limit": int(qs.limit),
         "state": str(qs.state),  # normal | warn_last_free | blocked
     }
+
+    # 3ter) total user messages count (conversation scope)
+    user_messages_count = 0
+    try:
+        user_messages_count = int(
+            await conn.fetchval(
+                """
+                select count(*)
+                from public.conversation_messages
+                where conversation_id = $1
+                  and role = 'user'
+                """,
+                conversation_id,
+            )
+            or 0
+        )
+    except Exception:
+        user_messages_count = 0
 
     # 4) facts + gates (smalltalk intro state)
     user_profile = dict(user) if user else {}
     facts = compute_facts_status(user_profile=user_profile, user_settings=settings)
 
     gates = compute_gates_status(user_status=user_status, facts=facts)
+
+    # ✅ Smalltalk "done" (source de vérité business)
+    missing_required_count = int(getattr(facts, "missing_count", 0) or 0)
+    smalltalk_done_derived = (missing_required_count <= 1) and (user_messages_count >= 8)
+
+    # Force gates (fastpath tant que smalltalk pas "done")
+    gates.smalltalk_intro_eligible = (not smalltalk_done_derived)
 
     # --- discovery gates (source of truth) ---
     discovery_status = (settings.get("discovery_status") or "pending").strip().lower()
@@ -198,10 +233,28 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
     limit = int(user_status.get("free_quota_limit") or 0)
     quota_ok = used < limit
 
-    facts_complete = (int(facts.missing_count or 0) == 0)
+    # Transition window = fenêtre pour proposer discovery avant bascule "discovery"
+    # Conditions (déterministes) :
+    # - user NON pro (sinon on passe en discovery state autrement)
+    # - quota ok (avant blocage)
+    # - smalltalk_done_derived (facts quasi complets + assez d'échanges)
+    # - discovery pas démarrée (to_do / null)
+    # - user_messages_count < 15 (fenêtre max)
+    is_discovery_todo = discovery_status in ("to_do", "null", "none", "")
 
-    transition_window = (not is_pro) and quota_ok and facts_complete
-    transition_reason = "free_quota_ok_facts_complete" if transition_window else None
+    transition_window = (
+        (not is_pro)
+        and quota_ok
+        and smalltalk_done_derived
+        and is_discovery_todo
+        and (user_messages_count < 15)
+    )
+
+    transition_reason = (
+        f"discovery_window:keyfacts_remaining={missing_required_count},user_messages_count={user_messages_count}"
+        if transition_window
+        else None
+    )
 
     # 5) persisted user facts (DB) — non destructif
     facts_store: List[Dict[str, Any]] = []
@@ -267,7 +320,7 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
     try:
         user_agents = await conn.fetch(
             """
-            select agent_key, status, onboarding_status, revoked_at
+            select agent_key, status, revoked_at
             from public.lisa_user_agents
             where user_id = $1
               and status = 'active'
@@ -280,40 +333,30 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
 
     active_agent_keys = [str(r["agent_key"]) for r in user_agents if r.get("agent_key")]
 
-    # --- Onboarding / Pro mode (source de vérité: lisa_user_agents + lisa_agents_catalog) ---
+    # --- Pro mode (source de vérité: lisa_user_agents) ---
     primary_agent_key = None
-    onboarding_status = None  # "started" | "complete" | None
-
     for r in user_agents:
         ak = r.get("agent_key")
         if ak:
             primary_agent_key = str(ak)
-            ob = r.get("onboarding_status")
-            onboarding_status = (str(ob) if ob is not None else None)
             break
 
     # pro_mode = tout sauf personal_assistant (inclut Ultimate + modes pro)
     pro_mode = bool(primary_agent_key) and (primary_agent_key != "personal_assistant")
 
-    # playbook full du mode concerné (si pro_mode)
-    playbook_full = None
-    if pro_mode and primary_agent_key:
-        row = (agents_by_key.get(primary_agent_key) or {})
-        pb = row.get("lisa_playbook")
-        if isinstance(pb, str) and pb.strip():
-            playbook_full = pb.strip()
-
+    # 7bis) Charger le catalogue des agents actifs (source)
     agents_catalog = []
     try:
         agents_catalog = await conn.fetch(
             """
             select
-              agent_key,
-              title,
-              requires_subscription,
-              requires_integrations,
-              executable_actions,
-              lisa_playbook
+            agent_key,
+            title,
+            requires_subscription,
+            requires_integrations,
+            executable_actions,
+            lisa_playbook,
+            lisa_instructions_short
             from public.lisa_agents_catalog
             where agent_key = any($1::text[])
             """,
@@ -322,7 +365,50 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
     except Exception:
         agents_catalog = []
 
+    # map agent_key -> row
     agents_by_key = {str(r["agent_key"]): dict(r) for r in agents_catalog if r.get("agent_key")}
+
+    # playbook full du mode concerné (si pro_mode)
+    playbook_full = None
+    playbook_light = None
+
+    if pro_mode and primary_agent_key:
+        row = agents_by_key.get(primary_agent_key) or {}
+
+        pb_full = row.get("lisa_playbook")
+        if isinstance(pb_full, str) and pb_full.strip():
+            playbook_full = pb_full.strip()
+
+        pb_light = row.get("lisa_instructions_short")
+        if isinstance(pb_light, str) and pb_light.strip():
+            playbook_light = pb_light.strip()
+
+    # 8bis) Charger état onboarding (nouvelle table dédiée)
+    onboarding_row = None
+    try:
+        onboarding_row = await conn.fetchrow(
+            """
+            select
+                level_max,
+                target,
+                status,
+                user_msgs_since_started,
+                started_at,
+                completed_at
+            from public.user_onboarding
+            where user_id = $1
+            """,
+            public_user_id,
+        )
+    except Exception:
+        onboarding_row = None
+
+    onboarding_state = dict(onboarding_row) if onboarding_row else None
+
+    # default (conservateur)
+    playbook_version = "light"
+    if pro_mode and (onboarding_state or {}).get("status") == "started":
+        playbook_version = "full"
 
     # 8) Intégrations connectées du user
     connected_integrations = []
@@ -339,6 +425,25 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
         connected_integrations = [str(r["integration_key"]) for r in integ_rows if r.get("integration_key")]
     except Exception:
         connected_integrations = []
+
+
+    # 8ter) Ever connected (présence historique) — IMPORTANT : sans filtre status
+    ever_connected = False
+    try:
+        ever_connected = bool(
+            await conn.fetchval(
+                """
+                select exists(
+                    select 1
+                    from public.lisa_user_integrations
+                    where user_id = $1
+                )
+                """,
+                public_user_id,
+            )
+        )
+    except Exception:
+        ever_connected = False
 
     # 9) Capabilities (déterministe)
     has_paid_agent = False
@@ -420,7 +525,22 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
         "connected_integrations": connected_integrations,
     }
 
-    # NOTE: onboarding_status viendra après (quand on l'ajoutera en DB)
+    # ---------------------------------------------------
+    # ONBOARDING GATES (nouveaux flags déterministes)
+    # ---------------------------------------------------
+
+    # 1) has_paid_active (source unique = quota / is_pro)
+    has_paid_active = bool(user_status.get("is_pro"))
+
+    # 2) has_pro_mode_active
+    # au moins un agent actif autre que personal_assistant
+    has_pro_mode_active = any(
+        k != "personal_assistant" for k in active_agent_keys
+    )
+
+    # 3) connected_tools_count (historique suffisant)
+    connected_tools_count = len(connected_integrations)  # connecté maintenant (info UX)
+    has_any_tool_connected = bool(ever_connected)        # ever connected (info onboarding)
 
 
     return {
@@ -460,9 +580,14 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
             "smalltalk_target_key": gates.smalltalk_target_key,
             "missing_required": facts.missing,
 
+            "keyfacts_remaining": int(missing_required_count),
+
             # discovery gates (nouveaux)
             "discovery_status": discovery_status,
             "discovery_forced": bool(forced_discovery),
+
+            "user_messages_count": int(user_messages_count),
+            "smalltalk_done_derived": bool(smalltalk_done_derived),
 
             # transition window (flag autonome)
             "transition_window": bool(transition_window),
@@ -475,10 +600,19 @@ async def load_context_light(conn: Connection, public_user_id: str, conversation
             "can_professional_request": bool(can_professional_request),
         },
         "onboarding": {
-            "status": onboarding_status,   # "started" | "complete" | None
+            # état table dédiée
+            "row": onboarding_state,
+
+            # flags calculés
+            "has_paid_active": has_paid_active,
+            "has_pro_mode_active": has_pro_mode_active,
+            "connected_tools_count": connected_tools_count,
+            "has_any_tool_connected": has_any_tool_connected,
+
+            # infos déjà présentes
+            "status": (onboarding_state or {}).get("status"),
             "pro_mode": bool(pro_mode),
             "primary_agent_key": primary_agent_key,
-            "playbook_full": playbook_full,  # str | None
         },
         "action_state": action_state,
         "docs": {
