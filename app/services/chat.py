@@ -21,14 +21,12 @@ SAFE_FALLBACK_ANSWER = "Désolé — je n’ai pas réussi à générer une rép
 class ChatError(Exception):
     pass
 
-
 async def _get_public_user_id_from_auth(conn: Connection, auth_user_id: str) -> str | None:
     row = await conn.fetchrow(
         "select id from public.users where auth_user_id = $1",
         auth_user_id,
     )
     return row["id"] if row else None
-
 
 async def _get_user_message(conn: Connection, conversation_id: str, user_message_id: str):
     return await conn.fetchrow(
@@ -40,7 +38,6 @@ async def _get_user_message(conn: Connection, conversation_id: str, user_message
         user_message_id,
         conversation_id,
     )
-
 
 async def _get_assistant_message(conn: Connection, assistant_message_id: str):
     return await conn.fetchrow(
@@ -88,7 +85,6 @@ def _pick_discovery_doc_scopes(ctx: dict) -> list[str]:
     # base doit exister, sinon on ne bloque pas : on envoie quand même base+fallback
     return [base, second]
 
-
 def _build_failsafe_light_plan(*, ctx: dict, state_decision, soft_paywall_warning: bool) -> dict:
     """
     Plan minimal: charge contexte light puis ResponseWriter.
@@ -125,8 +121,6 @@ def _build_failsafe_light_plan(*, ctx: dict, state_decision, soft_paywall_warnin
         },
     ]
     return {"nodes": nodes}
-
-
 
 async def handle_chat_message(
     conn: Connection,
@@ -190,6 +184,7 @@ async def handle_chat_message(
 
     # 4) Routing start
     llm = LLMRuntime()
+    provider = {"primary": "unknown", "fallback_used": False}
 
     chat_logger.info(
         "chat.routing.start",
@@ -307,7 +302,6 @@ async def handle_chat_message(
         # FASTPATH = STATE ONLY (no intent overlay)
         intent = ""  # important: RW ignorera l'intent en fastpath (et même sans ça on n'en veut pas)
         mode = str(getattr(state_decision, "state", "normal") or "normal")
-
 
         chat_logger.info(
             "chat.fastpath.enter",
@@ -730,7 +724,6 @@ async def handle_chat_message(
             exc_info=True,
         )
 
-
     # 6) Insert assistant message (idempotent via dedupe_key)
     dedupe_key = f"a:{conversation_id}:{user_message_id}"
 
@@ -898,7 +891,6 @@ async def handle_chat_message(
             )
     except Exception as _e:
         chat_logger.info("chat.discovery.force_pending_error", error=str(_e)[:180])
-
 
     # 6bis) Fire-and-forget user facts catcher (must not impact chat latency)
     chat_logger.info("userfacts.hook.before", conversation_id=str(conversation_id), user_message_id=str(user_message_id))

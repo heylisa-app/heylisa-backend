@@ -628,16 +628,31 @@ class PlanExecutor:
             playbook = self.out.get(playbook_node_id) if playbook_node_id else None
 
             # Pass-through des inputs orchestrateur (mode, gates, eligibility, etc.)
+
+            # intent:
+            # - en fastpath, on respecte l’intent tel quel (même vide) car l’overlay est ignoré côté RW
+            # - hors fastpath, on garde un fallback safe
+            _rs = str(inputs.get("route_source") or "orchestrator").strip().lower()
+            _raw_intent = inputs.get("intent", None)  # important: ne pas faire .get() + "or" ("" est voulu)
+            if _rs == "fastpath":
+                rw_intent = "" if _raw_intent is None else str(_raw_intent)
+            else:
+                rw_intent = str(_raw_intent).strip() if _raw_intent is not None else ""
+                if not rw_intent:
+                    rw_intent = "general_question"
+
             rw_inputs = dict(
                 user_message=self.user_message,
-                raw_user_message=self.user_message, 
-                intent=str(inputs.get("intent") or "general_question"),
+                raw_user_message=self.user_message,
+
+                intent=rw_intent,
                 mode=str(inputs.get("mode") or "normal"),
                 language=str(inputs.get("language") or "fr"),
                 tone=str(inputs.get("tone") or "warm"),
                 need_web=bool(inputs.get("need_web") or False),
                 route_source=str(inputs.get("route_source") or "orchestrator"),
                 runtime_state=str(inputs.get("state") or inputs.get("runtime_state") or ""),
+
                 docs_chunks=docs_chunks or {},
                 playbook=playbook or {},
 
@@ -646,7 +661,7 @@ class PlanExecutor:
                 intent_block_reason=inputs.get("intent_block_reason"),
                 transition_window=bool(inputs.get("transition_window", False)),
                 transition_reason=inputs.get("transition_reason"),
-                soft_paywall_warning = bool(inputs.get("soft_paywall_warning", False)) or should_soft_warn,
+                soft_paywall_warning=bool(inputs.get("soft_paywall_warning", False)) or should_soft_warn,
 
                 context=ctx or {},
                 quota=quota or {},
