@@ -34,7 +34,7 @@ USER_TEXT_MAX     = 4_000
 # Filet de sécurité: cap global par message (si sections introuvables)
 # (On laisse respirer un peu, mais on évite les prompts délirants)
 USER_MESSAGE_HARD_MAX   = 20_000
-SYSTEM_MESSAGE_HARD_MAX = 17_000
+SYSTEM_MESSAGE_HARD_MAX = 25_000
 
 # =========================
 # Retry / timeouts
