@@ -25,16 +25,16 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
 # =========================
 # Prompt caps (chars)
 # =========================
-STATE_BLOCK_MAX   = 5_000
+STATE_BLOCK_MAX   = 14_000
 PLAYBOOK_MAX      = 8_000
 DOCS_CHUNKS_MAX   = 6_000
 CTX_SUMMARY_MAX   = 6_000
-USER_TEXT_MAX     = 16_000
+USER_TEXT_MAX     = 4_000
 
 # Filet de sécurité: cap global par message (si sections introuvables)
 # (On laisse respirer un peu, mais on évite les prompts délirants)
 USER_MESSAGE_HARD_MAX   = 20_000
-SYSTEM_MESSAGE_HARD_MAX = 14_000
+SYSTEM_MESSAGE_HARD_MAX = 17_000
 
 # =========================
 # Retry / timeouts
@@ -122,11 +122,11 @@ def _cap_section(text: str, *, label: str, max_chars: int, start_patterns: List[
 
 
 def _cap_user_content(user_text: str) -> Tuple[str, List[str]]:
-    """
-    Cap “intelligent” : on tronque les sections si on les reconnaît, puis filet hard max.
-    Renvoie (user_text_cappé, sections_hit)
-    """
     sections_hit: List[str] = []
+
+    # ✅ IMPORTANT: si on est déjà sous le hard max, on NE TOUCHE PAS au prompt.
+    if user_text and len(user_text) <= USER_MESSAGE_HARD_MAX:
+        return user_text, sections_hit
 
     # Heuristique markers (à matcher sur tes prompts actuels)
     # -> Ajustables sans toucher au reste.
