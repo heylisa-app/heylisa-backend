@@ -9,6 +9,9 @@ from app.services.quota import get_quota_status
 from app.services.auth import get_auth_user_id_from_bearer, AuthError
 from app.services.chat import handle_chat_message, ChatError
 from app.services.chat_intro import handle_chat_intro, ChatIntroError
+from datetime import datetime
+from app.settings import settings
+
 import logging
 import traceback
 
@@ -18,7 +21,17 @@ router = APIRouter()
 
 
 @router.get("/health")
-async def health(pool: Pool = Depends(get_pool)):
+async def health():
+    return {
+        "ok": True,
+        "status": "healthy",
+        "environment": settings.environment,
+        "version": "0.1.0",
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+@router.get("/ready")
+async def ready(pool: Pool = Depends(get_pool)):
     async with pool.acquire() as conn:
         v = await conn.fetchval("select 1")
     return {"ok": True, "db": v}
