@@ -1,16 +1,17 @@
 # app/services/plan_executor.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 from asyncpg import Connection
 import time
 
 import os, json, hashlib
 from pathlib import Path
 
-from app.services.context_loader import load_context_light
+from app.services.context_loader_v2 import load_context_light, load_context_with_billing
 from app.services.quota import get_quota_status
 from app.tools.web_search import WebSearchTool
+from app.tools.web_search_medical import MedicalWebSearchTool
 from app.agents.response_writer import ResponseWriterAgent
 from app.agents.node_registry import NODE_TYPE_WHITELIST
 from app.core.chat_logger import chat_logger
@@ -208,10 +209,68 @@ class PlanExecutor:
 
         # tools/agents
         self.web_search_tool = WebSearchTool(llm)
+        self.web_search_medical_tool = MedicalWebSearchTool(llm)
         self.response_writer = ResponseWriterAgent(llm)
 
         # node outputs
         self.out: Dict[str, Any] = {}
+
+
+    def _build_response_writer_inputs(self, node: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Reconstitue exactement les inputs du ResponseWriter à partir des outputs
+        déjà produits par les nodes précédents.
+        """
+        inputs = node.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            inputs = {}
+
+        ctx_node_id = self._find_first_node_id("tool.db_load_context")
+        quota_node_id = self._find_first_node_id("tool.quota_check")
+        web_node_id = self._find_first_node_id("tool.web_search")
+        docs_node_id = self._find_first_node_id("tool.docs_chunks")
+        playbook_node_id = self._find_first_node_id("tool.playbook_load")
+
+        ctx = (self.out.get(ctx_node_id) or {}).get("context") if ctx_node_id else None
+        quota = self.out.get(quota_node_id) if quota_node_id else None
+        should_soft_warn = bool((quota or {}).get("should_soft_warn") is True)
+        web = self.out.get(web_node_id) if web_node_id else None
+        docs_chunks = self.out.get(docs_node_id) if docs_node_id else None
+        playbook = self.out.get(playbook_node_id) if playbook_node_id else None
+
+        _rs = str(inputs.get("route_source") or "orchestrator").strip().lower()
+        _raw_intent = inputs.get("intent", None)
+
+        if _rs == "fastpath":
+            rw_intent = "" if _raw_intent is None else str(_raw_intent)
+        else:
+            rw_intent = str(_raw_intent).strip() if _raw_intent is not None else ""
+            if not rw_intent:
+                rw_intent = "general_question"
+
+        return dict(
+            user_message=self.user_message,
+            raw_user_message=self.user_message,
+            intent=rw_intent,
+            mode=str(inputs.get("mode") or "normal"),
+            language=str(inputs.get("language") or "fr"),
+            tone=str(inputs.get("tone") or "warm"),
+            need_web=bool(inputs.get("need_web") or False),
+            route_source=str(inputs.get("route_source") or "orchestrator"),
+            runtime_state=str(inputs.get("state") or inputs.get("runtime_state") or ""),
+            docs_chunks=docs_chunks or {},
+            playbook=playbook or {},
+            smalltalk_target_key=inputs.get("smalltalk_target_key"),
+            intent_eligible=bool(inputs.get("intent_eligible", True)),
+            intent_block_reason=inputs.get("intent_block_reason"),
+            transition_window=bool(inputs.get("transition_window", False)),
+            transition_reason=inputs.get("transition_reason"),
+            soft_paywall_warning=bool(inputs.get("soft_paywall_warning", False)) or should_soft_warn,
+            trial_feedback_prompt_enabled=bool(inputs.get("trial_feedback_prompt_enabled", False)),
+            context=ctx or {},
+            quota=quota or {},
+            web=web or {},
+        )
 
     async def run(self, *, plan: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(plan, dict):
@@ -414,6 +473,260 @@ class PlanExecutor:
             "debug": debug_pack,
         }
 
+
+    async def run_stream(self, *, plan: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
+        if not isinstance(plan, dict):
+            raise PlanExecutionError("PLAN_NOT_A_DICT")
+
+        exec_start = time.perf_counter()
+
+        nodes = plan.get("nodes")
+        if not isinstance(nodes, list) or not nodes:
+            raise PlanExecutionError("PLAN_NODES_MISSING")
+
+        chat_logger.info(
+            "chat.executor.run_stream_start",
+            conversation_id=str(self.conversation_id),
+            public_user_id=str(self.public_user_id),
+            nodes_count=len(nodes),
+            node_ids=[str(n.get("id")) for n in nodes if isinstance(n, dict) and n.get("id")][:12],
+        )
+
+        pending: Dict[str, Dict[str, Any]] = {}
+        for n in nodes:
+            if isinstance(n, dict) and n.get("id"):
+                pending[str(n["id"])] = n
+
+        executed: set[str] = set()
+        final_answer = None
+        final_debug: Dict[str, Any] = {"node_outputs": {}}
+
+        while pending:
+            progressed = False
+
+            for node_id, node in list(pending.items()):
+                deps = node.get("depends_on") or []
+                if isinstance(deps, list) and all(d in executed for d in deps):
+                    node_type = str((node or {}).get("type") or "")
+                    node_inputs = (node or {}).get("inputs") or {}
+                    if not isinstance(node_inputs, dict):
+                        node_inputs = {}
+
+                    t0 = time.perf_counter()
+
+                    chat_logger.info(
+                        "chat.node.stream.start",
+                        conversation_id=str(self.conversation_id),
+                        public_user_id=str(self.public_user_id),
+                        node_id=str(node_id),
+                        node_type=node_type,
+                        depends_on=deps,
+                        inputs_keys=list(node_inputs.keys())[:20],
+                        inputs_preview=_preview(node_inputs) if DEBUG_PIPELINE else None,
+                    )
+
+                    try:
+                        if node_type != "agent.response_writer":
+                            res = await self._run_one(node)
+
+                            ok_val = None
+                            err_val = None
+                            if isinstance(res, dict):
+                                ok_val = res.get("ok")
+                                err_val = res.get("error")
+
+                            chat_logger.info(
+                                "chat.node.stream.end",
+                                conversation_id=str(self.conversation_id),
+                                public_user_id=str(self.public_user_id),
+                                node_id=str(node_id),
+                                node_type=node_type,
+                                ok=ok_val,
+                                error=err_val,
+                                duration_ms=int((time.perf_counter() - t0) * 1000),
+                                output_preview=_preview(res) if DEBUG_PIPELINE else None,
+                            )
+
+                            self.out[node_id] = res
+                            executed.add(node_id)
+                            del pending[node_id]
+                            progressed = True
+                            continue
+
+                        rw_inputs = self._build_response_writer_inputs(node)
+
+                        ctx = rw_inputs.get("context") or {}
+                        ctx_level = str((self.out.get(self._find_first_node_id("tool.db_load_context")) or {}).get("level") or "unknown")
+                        ctx_summary = _ctx_summary(ctx, level=ctx_level) if ctx else {"facts_count": 0}
+
+                        playbook = rw_inputs.get("playbook") or {}
+                        chat_logger.info(
+                            "chat.response_writer.stream.call",
+                            conversation_id=str(self.conversation_id),
+                            public_user_id=str(self.public_user_id),
+                            node_id=str(node.get("id") or "D"),
+                            intent=rw_inputs["intent"],
+                            mode=rw_inputs["mode"],
+                            route_source=rw_inputs.get("route_source"),
+                            runtime_state=rw_inputs.get("runtime_state"),
+                            language=rw_inputs["language"],
+                            need_web=rw_inputs["need_web"],
+                            transition_window=bool(rw_inputs.get("transition_window", False)),
+                            transition_reason=rw_inputs.get("transition_reason"),
+                            ctx_level=ctx_level,
+                            facts_count=int(ctx_summary.get("facts_count", 0)),
+                            has_ctx=bool(rw_inputs["context"]),
+                            has_quota=bool(rw_inputs["quota"]),
+                            has_web=bool(rw_inputs["web"]),
+                            has_docs=bool((rw_inputs.get("docs_chunks") or {}).get("chunks")),
+                            trial_feedback_prompt_enabled=bool(rw_inputs.get("trial_feedback_prompt_enabled", False)),
+                            has_playbook=bool(playbook and playbook.get("ok")),
+                        )
+
+                        streamed_answer_parts: List[str] = []
+                        stream_error = None
+                        stream_final_payload = None
+
+                        async for ev in self.response_writer.run_stream(**rw_inputs):
+                            etype = ev.get("type")
+
+                            if etype == "start":
+                                final_debug["provider"] = {
+                                    "provider": ev.get("provider"),
+                                    "model": ev.get("model"),
+                                }
+                                continue
+
+                            if etype == "delta":
+                                chunk = str(ev.get("text") or "")
+                                if chunk:
+                                    streamed_answer_parts.append(chunk)
+                                    yield {
+                                        "type": "delta",
+                                        "text": chunk,
+                                    }
+                                continue
+
+                            if etype == "error":
+                                stream_error = ev
+                                break
+
+                            if etype == "final":
+                                stream_final_payload = ev
+                                break
+
+                        if stream_error:
+                            err_code = stream_error.get("error")
+
+                            if err_code == "ESCALATE_TO_ORCHESTRATOR":
+                                yield {
+                                    "type": "escalate",
+                                    "reason": stream_error.get("reason") or "unspecified",
+                                    "debug": stream_error.get("debug") or {},
+                                }
+                                return
+
+                            yield {
+                                "type": "error",
+                                "error": err_code or "RESPONSE_WRITER_STREAM_ERROR",
+                                "message": stream_error.get("message") or "",
+                                "debug": stream_error.get("debug") or {},
+                            }
+                            return
+
+                        if not stream_final_payload:
+                            yield {
+                                "type": "error",
+                                "error": "RESPONSE_WRITER_STREAM_EMPTY_FINAL",
+                                "message": "No final payload from response writer stream",
+                                "debug": {},
+                            }
+                            return
+
+                        final_answer = stream_final_payload.get("answer") or "".join(streamed_answer_parts) or SAFE_FALLBACK_ANSWER
+                        final_debug["response_writer"] = stream_final_payload.get("debug") or {}
+
+                        res = {
+                            "ok": True,
+                            "answer": final_answer,
+                            "debug": stream_final_payload.get("debug") or {},
+                        }
+
+                        self.out[node_id] = res
+
+                        chat_logger.info(
+                            "chat.node.stream.end",
+                            conversation_id=str(self.conversation_id),
+                            public_user_id=str(self.public_user_id),
+                            node_id=str(node_id),
+                            node_type=node_type,
+                            ok=True,
+                            error=None,
+                            duration_ms=int((time.perf_counter() - t0) * 1000),
+                            output_preview=_preview(res) if DEBUG_PIPELINE else None,
+                        )
+
+                        executed.add(node_id)
+                        del pending[node_id]
+                        progressed = True
+
+                    except Exception as e:
+                        chat_logger.error(
+                            "chat.node.stream.error",
+                            conversation_id=str(self.conversation_id),
+                            public_user_id=str(self.public_user_id),
+                            node_id=str(node_id),
+                            node_type=node_type,
+                            error=str(e)[:300],
+                            duration_ms=int((time.perf_counter() - t0) * 1000),
+                            exc_info=True,
+                        )
+                        yield {
+                            "type": "error",
+                            "error": "PLAN_NODE_STREAM_ERROR",
+                            "message": str(e)[:200],
+                            "debug": {"node_id": node_id, "node_type": node_type},
+                        }
+                        return
+
+            if not progressed:
+                chat_logger.error(
+                    "chat.executor.stream.stuck",
+                    conversation_id=str(self.conversation_id),
+                    public_user_id=str(self.public_user_id),
+                    pending_ids=list(pending.keys())[:20],
+                )
+                yield {
+                    "type": "error",
+                    "error": "PLAN_STUCK_UNRESOLVED_DEPS",
+                    "message": "Plan executor got stuck",
+                    "debug": {"pending_ids": list(pending.keys())[:20]},
+                }
+                return
+
+        try:
+            await sync_user_onboarding(
+                self.conn,
+                user_id=str(self.public_user_id),
+            )
+        except Exception:
+            pass
+
+        chat_logger.info(
+            "chat.executor.run_stream_end",
+            conversation_id=str(self.conversation_id),
+            public_user_id=str(self.public_user_id),
+            duration_ms=int((time.perf_counter() - exec_start) * 1000),
+            answer_len=len(final_answer or ""),
+        )
+
+        yield {
+            "type": "final",
+            "answer": final_answer or SAFE_FALLBACK_ANSWER,
+            "debug": final_debug,
+        }
+
+
     async def _run_one(self, node: Dict[str, Any]) -> Dict[str, Any]:
         ntype = node.get("type")
 
@@ -424,9 +737,20 @@ class PlanExecutor:
             inputs = {}
 
         if ntype == "tool.db_load_context":
-            # v0: on utilise load_context_light pour tous les niveaux (on enrichira après)
-            level = str(inputs.get("level") or "medium")
-            ctx = await load_context_light(self.conn, str(self.public_user_id), self.conversation_id)
+            level = str(inputs.get("level") or "medium").strip().lower()
+
+            if level == "billing":
+                ctx = await load_context_with_billing(
+                    self.conn,
+                    str(self.public_user_id),
+                    self.conversation_id,
+                )
+            else:
+                ctx = await load_context_light(
+                    self.conn,
+                    str(self.public_user_id),
+                    self.conversation_id,
+                )
 
             # ✅ LOG SAFE (pas de valeurs, juste métadonnées)
             try:
@@ -436,8 +760,9 @@ class PlanExecutor:
                     conversation_id=str(self.conversation_id),
                     public_user_id=str(self.public_user_id),
                     **summary,
+                    has_billing=bool(isinstance(ctx, dict) and ctx.get("billing")),
                 )
-            except Exception as _e:
+            except Exception:
                 chat_logger.info(
                     "chat.ctx.summary",
                     conversation_id=str(self.conversation_id),
@@ -469,6 +794,15 @@ class PlanExecutor:
             prompt = inputs.get("prompt")
             language = str(inputs.get("language") or "fr")
             res = await self.web_search_tool.run(prompt=str(prompt or ""), language=language)
+            return res
+
+        if ntype == "tool.web_search_medical":
+            prompt = inputs.get("prompt")
+            language = str(inputs.get("language") or "fr")
+            res = await self.web_search_medical_tool.run(
+                prompt=str(prompt or ""),
+                language=language,
+            )
             return res
 
         if ntype == "tool.docs_chunks":
@@ -662,6 +996,7 @@ class PlanExecutor:
                 transition_window=bool(inputs.get("transition_window", False)),
                 transition_reason=inputs.get("transition_reason"),
                 soft_paywall_warning=bool(inputs.get("soft_paywall_warning", False)) or should_soft_warn,
+                trial_feedback_prompt_enabled=bool(inputs.get("trial_feedback_prompt_enabled", False)),
 
                 context=ctx or {},
                 quota=quota or {},
@@ -710,6 +1045,7 @@ class PlanExecutor:
                 has_quota=bool(rw_inputs["quota"]),
                 has_web=bool(rw_inputs["web"]),
                 has_docs=bool(docs_chunks and isinstance(docs_chunks, dict) and docs_chunks.get("chunks")),
+                trial_feedback_prompt_enabled=bool(rw_inputs.get("trial_feedback_prompt_enabled", False)),
                 has_playbook=bool(playbook and playbook.get("ok")),
             )
 

@@ -6,17 +6,102 @@ from asyncpg import Connection
 from app.llm.runtime import LLMRuntime
 from app.agents.orchestrator import OrchestratorAgent
 from app.services.plan_executor import PlanExecutor
-from app.services.context_loader import load_context_light
+from app.services.context_loader_v2 import load_context_light, load_context_with_billing
+from typing import AsyncIterator
 
 from app.core.chat_logger import chat_logger
 from app.integrations.n8n_userfacts import fire_userfact_webhook
 from app.services.message_flags import extract_and_clean_message_flags
-from app.services.intent_routing.state_resolver import resolve_state
+from app.services.intent_routing.state_resolver_v2 import resolve_state_v2
 from app.services.intent_routing.gates import apply_gates
 from app.services.onboarding_state import apply_onboarding_state
 from app.llm.runtime import LLMCallError
+from app.integrations.n8n_feedback_analysis import fire_feedback_analysis_webhook
 
 SAFE_FALLBACK_ANSWER = "Désolé — je n’ai pas réussi à générer une réponse. Réessaie."
+TRIAL_FEEDBACK_BILLING_ALLOWED = {
+    "trial_active",
+    "trial_contacted",
+    "trial_expired_waiting_response",
+    "suspended",
+}
+
+TRIAL_FEEDBACK_BILLING_BLOCKED = {
+    "pending_payment",
+    "active_paid",
+    "grace_period",
+    "closed",
+}
+
+
+def _is_trial_feedback_billing_compatible(billing_status: str | None) -> bool:
+    s = str(billing_status or "").strip().lower()
+    if not s:
+        return False
+    if s in TRIAL_FEEDBACK_BILLING_BLOCKED:
+        return False
+    return s in TRIAL_FEEDBACK_BILLING_ALLOWED
+
+def _compute_trial_feedback_flags(ctx: dict) -> dict:
+    billing_ctx = (ctx or {}).get("billing") or {}
+
+    billing_status = str(billing_ctx.get("billing_status") or "").strip().lower()
+    billing_compatible = _is_trial_feedback_billing_compatible(billing_status)
+
+    trial_feedback_context_active = bool(
+        billing_ctx.get("trial_feedback_context_active") is True
+    )
+    trial_feedback_context_closed = bool(
+        billing_ctx.get("trial_feedback_context_closed") is True
+    )
+
+    history_msgs = (((ctx or {}).get("history") or {}).get("messages") or [])
+    if not isinstance(history_msgs, list):
+        history_msgs = []
+
+    last_lisa_contains_trial_phrase = False
+    for m in reversed(history_msgs):
+        if not isinstance(m, dict):
+            continue
+
+        sender_type = str(m.get("sender_type") or "").strip().lower()
+        role = str(m.get("role") or "").strip().lower()
+        content = str(m.get("content") or "")
+
+        if sender_type == "lisa" or role == "assistant":
+            if "fin de ma période d’essai" in content.lower():
+                last_lisa_contains_trial_phrase = True
+            break
+
+    # ouverture conversationnelle si déjà active en DB
+    # ou si le dernier message Lisa a explicitement ouvert le sujet
+    conversation_trial_open = bool(
+        trial_feedback_context_active or last_lisa_contains_trial_phrase
+    )
+
+    # fermeture définitive : si le contexte est closed en DB, terminé pour toujours
+    # ou si billing est devenu incompatible ET qu'on avait déjà ouvert ce sujet
+    permanently_closed = bool(
+        trial_feedback_context_closed
+        or (conversation_trial_open and not billing_compatible)
+    )
+
+    trial_feedback_active = bool(
+        conversation_trial_open
+        and not permanently_closed
+        and billing_compatible
+    )
+
+    return {
+        "billing_status": billing_status,
+        "billing_compatible": billing_compatible,
+        "trial_feedback_context_active": trial_feedback_context_active,
+        "trial_feedback_context_closed": trial_feedback_context_closed,
+        "last_lisa_contains_trial_phrase": last_lisa_contains_trial_phrase,
+        "conversation_trial_open": conversation_trial_open,
+        "permanently_closed": permanently_closed,
+        "trial_feedback_active": trial_feedback_active,
+    }
 
 class ChatError(Exception):
     pass
@@ -49,41 +134,388 @@ async def _get_assistant_message(conn: Connection, assistant_message_id: str):
         assistant_message_id,
     )
 
+TRIAL_FEEDBACK_KEYPHRASE = "fin de ma période d’essai"
+
+
+async def _get_last_lisa_message(conn: Connection, conversation_id: str):
+    return await conn.fetchrow(
+        """
+        select id, content, sent_at, metadata
+        from public.conversation_messages
+        where conversation_id = $1::uuid
+          and sender_type = 'lisa'
+          and role = 'assistant'
+        order by sent_at desc, id desc
+        limit 1
+        """,
+        conversation_id,
+    )
+
+
+async def _get_billing_status(conn: Connection, public_user_id: str):
+    return await conn.fetchrow(
+        """
+        select billing_status, billing_substatus
+        from public.user_billing_status
+        where public_user_id = $1::uuid
+        limit 1
+        """,
+        public_user_id,
+    )
+
+
+async def _compute_trial_feedback_flag(
+    conn: Connection,
+    *,
+    conversation_id: str,
+    public_user_id: str,
+) -> dict:
+    last_lisa_msg = await _get_last_lisa_message(conn, conversation_id)
+    billing_row = await _get_billing_status(conn, public_user_id)
+
+    last_lisa_content = str((last_lisa_msg["content"] if last_lisa_msg else "") or "")
+    billing_status = str((billing_row["billing_status"] if billing_row else "") or "").strip()
+    billing_substatus = str((billing_row["billing_substatus"] if billing_row else "") or "").strip()
+
+    last_lisa_contains_trial_phrase = TRIAL_FEEDBACK_KEYPHRASE in last_lisa_content
+
+    billing_keeps_trial_feedback_active = billing_status in {
+        "trial_contacted",
+        "trial_expired_waiting_response",
+        "pending_payment",
+    }
+
+    trial_feedback_active = (
+        last_lisa_contains_trial_phrase
+        or billing_keeps_trial_feedback_active
+    )
+
+    return {
+        "trial_feedback_active": trial_feedback_active,
+        "last_lisa_contains_trial_phrase": last_lisa_contains_trial_phrase,
+        "billing_status": billing_status or None,
+        "billing_substatus": billing_substatus or None,
+    }
+
+async def _insert_or_update_assistant_message(
+    conn: Connection,
+    *,
+    conversation_id: str,
+    public_user_id: str,
+    user_message_id: str,
+    reply_text: str,
+    provider: dict,
+    orch,
+) -> dict:
+    dedupe_key = f"a:{conversation_id}:{user_message_id}"
+
+    mode = None
+    try:
+        for n in (orch.plan or {}).get("nodes", []):
+            if isinstance(n, dict) and n.get("type") == "agent.response_writer":
+                mode = ((n.get("inputs") or {}) if isinstance(n.get("inputs"), dict) else {}).get("mode")
+                break
+    except Exception:
+        mode = None
+
+    intent_final = None
+    try:
+        dbg = getattr(orch, "debug", None)
+        if isinstance(dbg, dict):
+            intent_final = dbg.get("intent_final") or dbg.get("intent")
+    except Exception:
+        intent_final = None
+
+    if not intent_final:
+        intent_final = getattr(orch, "intent", None)
+
+    assistant_meta = {
+        "event_type": "backend_chat",
+        "provider": provider,
+        "orch": {
+            "intent_final": str(intent_final or ""),
+            "mode": str(mode or ""),
+            "need_web": bool(getattr(orch, "need_web", False)),
+            "confidence": float(getattr(orch, "confidence", 0.0) or 0.0),
+        }
+    }
+
+    inserted = await conn.fetchrow(
+        """
+        insert into public.conversation_messages
+        (conversation_id, user_id, sender_type, role, content, metadata, dedupe_key)
+        values
+        ($1, $2::uuid, 'lisa', 'assistant', $3, $4::jsonb, $5)
+        on conflict (dedupe_key) do update
+        set content = excluded.content,
+            metadata = excluded.metadata
+        returning id, sent_at
+        """,
+        conversation_id,
+        public_user_id,
+        reply_text,
+        json.dumps(assistant_meta, default=str),
+        dedupe_key,
+    )
+
+    assistant_message_id = str(inserted["id"])
+
+    await conn.execute(
+        """
+        update public.conversation_messages
+        set metadata = coalesce(metadata, '{}'::jsonb) ||
+        jsonb_build_object(
+            'processed_by_backend', true,
+            'assistant_message_id', $2::uuid
+        )
+        where id = $1::uuid
+        """,
+        user_message_id,
+        assistant_message_id,
+    )
+
+    return {
+        "assistant_message_id": assistant_message_id,
+        "sent_at": inserted["sent_at"].isoformat(),
+        "assistant_meta": assistant_meta,
+    }
+
+
+async def _postprocess_assistant_message(
+    conn: Connection,
+    *,
+    public_user_id: str,
+    ctx: dict,
+    provider: dict,
+    msg,
+    conversation_id: str,
+    user_message_id: str,
+    assistant_message_id: str,
+) -> None:
+    """
+    Post-process minimal V1 :
+    - déclenche uniquement le webhook userfacts
+    - ne remet PAS les writes legacy onboarding / smalltalk / discovery
+    """
+    chat_logger.info(
+        "userfacts.hook.before",
+        conversation_id=str(conversation_id),
+        user_message_id=str(user_message_id),
+    )
+
+    try:
+        payload = {
+            "source": "chat_message",
+            "public_user_id": str(public_user_id),
+            "conversation_id": str(conversation_id),
+            "conversation_channel": ((ctx or {}).get("conversation") or {}).get("channel"),
+            "user_message_id": str(user_message_id),
+            "assistant_message_id": str(assistant_message_id),
+            "user_text": (msg["content"] or ""),
+            "assistant_text": "",  # volontairement vide ici pour rester minimal
+            "locale": ((ctx or {}).get("settings") or {}).get("locale_main"),
+            "timezone": ((ctx or {}).get("settings") or {}).get("timezone"),
+            "cabinet_account_id": ((ctx or {}).get("cabinet") or {}).get("id"),
+            "member_role": ((ctx or {}).get("member") or {}).get("role"),
+            "member_job_role": ((ctx or {}).get("member") or {}).get("job_role"),
+        }
+
+        chat_logger.info(
+            "userfacts.hook.payload_ready",
+            public_user_id=str(public_user_id),
+        )
+
+        import asyncio
+        asyncio.create_task(fire_userfact_webhook(payload))
+
+        chat_logger.info("userfacts.hook.task_scheduled")
+
+    except Exception as e:
+        chat_logger.info("userfacts.webhook.call_error", error=str(e)[:180])
+
+    try:
+        provider_flags = ((provider or {}).get("flags") or {})
+        trial_feedback = bool(provider_flags.get("trial_feedback") is True)
+
+        if trial_feedback:
+            payload = {
+                "source": "chat_trial_feedback",
+                "public_user_id": str(public_user_id),
+                "conversation_id": str(conversation_id),
+                "conversation_channel": ((ctx or {}).get("conversation") or {}).get("channel"),
+                "user_message_id": str(user_message_id),
+                "assistant_message_id": str(assistant_message_id),
+                "user_text": (msg["content"] or ""),
+                "assistant_text": "",  # volontairement vide ici, comme userfacts minimal
+                "cabinet_account_id": ((ctx or {}).get("cabinet") or {}).get("id"),
+                "member_role": ((ctx or {}).get("member") or {}).get("role"),
+                "member_job_role": ((ctx or {}).get("member") or {}).get("job_role"),
+                "billing_status": ((ctx or {}).get("conversation_flags") or {}).get("billing_status"),
+                "billing_substatus": ((ctx or {}).get("conversation_flags") or {}).get("billing_substatus"),
+                "trial_feedback_active": ((ctx or {}).get("conversation_flags") or {}).get("trial_feedback_active"),
+            }
+
+            chat_logger.info(
+                "feedback_analysis.hook.payload_ready",
+                public_user_id=str(public_user_id),
+                conversation_id=str(conversation_id),
+                user_message_id=str(user_message_id),
+                assistant_message_id=str(assistant_message_id),
+            )
+
+            import asyncio
+            asyncio.create_task(fire_feedback_analysis_webhook(payload))
+
+            chat_logger.info("feedback_analysis.hook.task_scheduled")
+
+    except Exception as e:
+        chat_logger.info("feedback_analysis.webhook.call_error", error=str(e)[:180])
+
+
+async def _persist_onboarding_flags(
+    conn: Connection,
+    *,
+    public_user_id: str,
+    flags_meta: dict,
+) -> None:
+    """
+    Source de vérité unique pour la progression onboarding/discovery.
+    Écrit uniquement dans public.user_onboarding_state.
+    """
+    try:
+        if not isinstance(flags_meta, dict):
+            chat_logger.info(
+                "chat.onboarding.flags.skipped_invalid",
+                public_user_id=str(public_user_id),
+                flags_type=str(type(flags_meta)),
+            )
+            return
+
+        chat_logger.info(
+            "chat.onboarding.flags.received",
+            public_user_id=str(public_user_id),
+            aha_request=bool(flags_meta.get("aha_request")),
+            aha_moment=bool(flags_meta.get("aha_moment")),
+            discovery_abort=bool(flags_meta.get("discovery_abort")),
+            flags_meta=flags_meta,
+        )
+
+        if flags_meta.get("aha_request") is True:
+            updated_user_id = await conn.fetchval(
+                """
+                update public.user_onboarding_state
+                set discovery_status = 'pending',
+                    updated_at = now()
+                where user_id = $1::uuid
+                  and coalesce(discovery_status, 'to_do') in ('to_do', '')
+                returning user_id
+                """,
+                public_user_id,
+            )
+
+            row = await conn.fetchrow(
+                """
+                select
+                    user_id,
+                    discovery_status,
+                    discovery_completed_at,
+                    updated_at
+                from public.user_onboarding_state
+                where user_id = $1::uuid
+                limit 1
+                """,
+                public_user_id,
+            )
+
+            chat_logger.info(
+                "chat.onboarding.flags.aha_request_applied",
+                public_user_id=str(public_user_id),
+                updated=bool(updated_user_id),
+                row=dict(row) if row else None,
+            )
+
+        if flags_meta.get("aha_moment") is True:
+            updated_user_id = await conn.fetchval(
+                """
+                update public.user_onboarding_state
+                set discovery_status = 'complete',
+                    discovery_completed_at = now(),
+                    updated_at = now()
+                where user_id = $1::uuid
+                returning user_id
+                """,
+                public_user_id,
+            )
+
+            row = await conn.fetchrow(
+                """
+                select
+                    user_id,
+                    discovery_status,
+                    discovery_completed_at,
+                    updated_at
+                from public.user_onboarding_state
+                where user_id = $1::uuid
+                limit 1
+                """,
+                public_user_id,
+            )
+
+            chat_logger.info(
+                "chat.onboarding.flags.aha_moment_applied",
+                public_user_id=str(public_user_id),
+                updated=bool(updated_user_id),
+                row=dict(row) if row else None,
+            )
+
+        elif flags_meta.get("discovery_abort") is True:
+            updated_user_id = await conn.fetchval(
+                """
+                update public.user_onboarding_state
+                set discovery_status = 'aborted',
+                    updated_at = now()
+                where user_id = $1::uuid
+                  and coalesce(discovery_status, 'pending') <> 'complete'
+                returning user_id
+                """,
+                public_user_id,
+            )
+
+            row = await conn.fetchrow(
+                """
+                select
+                    user_id,
+                    discovery_status,
+                    discovery_completed_at,
+                    updated_at
+                from public.user_onboarding_state
+                where user_id = $1::uuid
+                limit 1
+                """,
+                public_user_id,
+            )
+
+            chat_logger.info(
+                "chat.onboarding.flags.discovery_abort_applied",
+                public_user_id=str(public_user_id),
+                updated=bool(updated_user_id),
+                row=dict(row) if row else None,
+            )
+
+    except Exception as e:
+        chat_logger.info(
+            "chat.onboarding.flags.persist_error",
+            public_user_id=str(public_user_id),
+            error=str(e)[:180],
+        )
+
+
 def _pick_discovery_doc_scopes(ctx: dict) -> list[str]:
     """
-    Retourne exactement 2 scopes:
-    1) discovery.value_proposition (toujours)
-    2) discovery.<agent_key> si match ET unique agent actif, sinon discovery.default_all_profiles
+    V2 :
+    discovery_capabilities charge obligatoirement la doc médicale métier.
     """
-    base = "discovery.value_proposition"
-    fallback = "discovery.default_all_profiles"
-
-    scopes_all = []
-    try:
-        scopes_all = ((ctx or {}).get("docs") or {}).get("scopes_all") or []
-    except Exception:
-        scopes_all = []
-    scopes_all = [str(s) for s in scopes_all if isinstance(s, str) and s.strip()]
-
-    # active agent keys
-    active_keys = []
-    try:
-        active_keys = ((ctx or {}).get("action_state") or {}).get("active_agent_keys") or []
-    except Exception:
-        active_keys = []
-    active_keys = [str(k) for k in active_keys if isinstance(k, str) and k.strip()]
-
-    # règle : si plusieurs agents actifs => fallback
-    second = fallback
-    if len(active_keys) == 1:
-        candidate = f"discovery.{active_keys[0]}"
-        if candidate in scopes_all:
-            second = candidate
-        else:
-            second = fallback
-
-    # base doit exister, sinon on ne bloque pas : on envoie quand même base+fallback
-    return [base, second]
+    return ["discovery.medical_assistant"]
 
 def _build_failsafe_light_plan(*, ctx: dict, state_decision, soft_paywall_warning: bool) -> dict:
     """
@@ -121,6 +553,340 @@ def _build_failsafe_light_plan(*, ctx: dict, state_decision, soft_paywall_warnin
         },
     ]
     return {"nodes": nodes}
+
+async def handle_chat_message_stream(
+    conn: Connection,
+    *,
+    conversation_id: str,
+    user_message_id: str,
+    auth_user_id: str | None,
+) -> AsyncIterator[dict]:
+    msg = await _get_user_message(conn, conversation_id, user_message_id)
+    if not msg:
+        raise ChatError("User message not found for this conversation")
+
+    public_user_id = msg["user_id"]
+
+    if auth_user_id:
+        expected_public_user_id = await _get_public_user_id_from_auth(conn, auth_user_id)
+        if not expected_public_user_id:
+            raise ChatError("No public user linked to this auth user")
+        if str(expected_public_user_id) != str(public_user_id):
+            raise ChatError("Message does not belong to authenticated user")
+
+    meta = msg["metadata"] or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+
+    existing_assistant_id = meta.get("assistant_message_id")
+    if existing_assistant_id:
+        existing = await _get_assistant_message(conn, existing_assistant_id)
+        if existing:
+            yield {
+                "type": "done",
+                "assistant_message": {
+                    "id": str(existing["id"]),
+                    "sent_at": existing["sent_at"].isoformat(),
+                    "content": existing["content"],
+                },
+                "provider": {"primary": "cache", "fallback_used": False},
+            }
+            return
+
+    llm = LLMRuntime()
+    provider = {"primary": "unknown", "fallback_used": False}
+
+    ctx = await load_context_with_billing(
+        conn=conn,
+        public_user_id=str(public_user_id),
+        conversation_id=str(conversation_id),
+    )
+
+    chat_logger.info(
+        "chat.billing.ctx_loaded",
+        conversation_id=str(conversation_id),
+        public_user_id=str(public_user_id),
+        has_billing=bool((ctx or {}).get("billing")),
+        billing_status=((ctx or {}).get("billing") or {}).get("billing_status"),
+        trial_feedback_context_active=((ctx or {}).get("billing") or {}).get("trial_feedback_context_active"),
+        trial_feedback_context_closed=((ctx or {}).get("billing") or {}).get("trial_feedback_context_closed"),
+    )
+
+    onboarding_result = await apply_onboarding_state(
+        conn=conn,
+        ctx=ctx,
+        public_user_id=str(public_user_id),
+        is_user_message=True,
+    )
+    ctx["onboarding_runtime"] = onboarding_result
+
+    trial_flags = _compute_trial_feedback_flags(ctx or {})
+
+    ctx.setdefault("gates", {})
+    ctx["gates"]["trial_feedback_active"] = trial_flags["trial_feedback_active"]
+    ctx["gates"]["last_lisa_contains_trial_phrase"] = trial_flags["last_lisa_contains_trial_phrase"]
+    ctx["gates"]["billing_status"] = trial_flags["billing_status"]
+    ctx["gates"]["billing_compatible_for_trial_feedback"] = trial_flags["billing_compatible"]
+    ctx["gates"]["trial_feedback_context_active"] = trial_flags["trial_feedback_context_active"]
+    ctx["gates"]["trial_feedback_context_closed"] = trial_flags["trial_feedback_context_closed"]
+    ctx["gates"]["trial_feedback_permanently_closed"] = trial_flags["permanently_closed"]
+
+    chat_logger.info(
+        "chat.trial_feedback.flags",
+        conversation_id=str(conversation_id),
+        public_user_id=str(public_user_id),
+        trial_feedback_active=bool(trial_flags["trial_feedback_active"]),
+        last_lisa_contains_trial_phrase=bool(trial_flags["last_lisa_contains_trial_phrase"]),
+        billing_status=trial_flags["billing_status"],
+        billing_compatible=bool(trial_flags["billing_compatible"]),
+        trial_feedback_context_active=bool(trial_flags["trial_feedback_context_active"]),
+        trial_feedback_context_closed=bool(trial_flags["trial_feedback_context_closed"]),
+        trial_feedback_permanently_closed=bool(trial_flags["permanently_closed"]),
+    )
+
+    state_decision = resolve_state_v2(ctx=ctx or {})
+    gates_decision = apply_gates(ctx=ctx or {})
+    soft_paywall_warning = bool(gates_decision.get("soft_paywall_warning"))
+
+    if bool(getattr(state_decision, "fastpath_allowed", False)) is True:
+        language = (((ctx or {}).get("settings") or {}).get("locale_main", "fr").split("-")[0]) or "fr"
+        intent = ""
+        mode = str(getattr(state_decision, "state", "normal") or "normal")
+
+        nodes = [
+            {
+                "id": "A",
+                "type": "tool.db_load_context",
+                "parallel_group": "P1",
+                "inputs": {"level": "light"},
+            },
+        ]
+
+        if state_decision.state == "discovery_capabilities":
+            scopes = _pick_discovery_doc_scopes(ctx or {})
+            nodes.append(
+                {
+                    "id": "S",
+                    "type": "tool.docs_chunks",
+                    "depends_on": ["A"],
+                    "inputs": {"scopes": scopes},
+                }
+            )
+
+        deps = ["A"] + (["S"] if state_decision.state == "discovery_capabilities" else [])
+
+        nodes.append(
+            {
+                "id": "D",
+                "type": "agent.response_writer",
+                "depends_on": deps,
+                "inputs": {
+                    "intent": intent,
+                    "mode": mode,
+                    "route_source": "fastpath",
+                    "runtime_state": str(state_decision.state),
+                    "language": language,
+                    "tone": "warm",
+                    "need_web": False,
+                    "soft_paywall_warning": soft_paywall_warning,
+                    "transition_window": bool(getattr(state_decision, "transition_window", False)),
+                    "transition_reason": getattr(state_decision, "transition_reason", None),
+                    "smalltalk_target_key": ((ctx or {}).get("gates") or {}).get("smalltalk_target_key"),
+                },
+            }
+        )
+
+        plan = {"nodes": nodes}
+
+        orch = type("OrchStub", (), {})()
+        orch.ok = True
+        orch.intent = intent
+        orch.language = language
+        orch.need_web = False
+        orch.confidence = 1.0
+        orch.plan = plan
+        orch.debug = {
+            "intent_final": intent,
+            "mode": mode,
+            "meta": {"provider": "fastpath"},
+        }
+
+    else:
+        orchestrator = OrchestratorAgent(llm)
+
+        try:
+            orch = await orchestrator.run(user_message=msg["content"], ctx=ctx)
+        except Exception as e:
+            chat_logger.error(
+                "chat.orchestrator.failsafe_triggered",
+                conversation_id=str(conversation_id),
+                user_message_id=str(user_message_id),
+                error_type=type(e).__name__,
+                error=str(e)[:240],
+                exc_info=True,
+            )
+
+            plan = _build_failsafe_light_plan(
+                ctx=ctx or {},
+                state_decision=state_decision,
+                soft_paywall_warning=soft_paywall_warning,
+            )
+
+            orch = type("OrchStub", (), {})()
+            orch.ok = False
+            orch.intent = ""
+            orch.language = (((ctx or {}).get("settings") or {}).get("locale_main", "fr").split("-")[0]) or "fr"
+            orch.need_web = False
+            orch.confidence = 0.0
+            orch.plan = plan
+            orch.debug = {
+                "intent_final": "",
+                "mode": str(getattr(state_decision, "state", "") or "normal"),
+                "meta": {"provider": "failsafe"},
+                "error_type": type(e).__name__,
+            }
+
+        try:
+            forced_state = str(getattr(state_decision, "state", "") or "")
+            if isinstance(getattr(orch, "plan", None), dict):
+                for n in orch.plan.get("nodes", []):
+                    if isinstance(n, dict) and n.get("type") == "agent.response_writer":
+                        inputs = n.get("inputs") or {}
+                        if isinstance(inputs, dict):
+                            inputs["route_source"] = "orchestrator"
+                            inputs["runtime_state"] = forced_state
+                            inputs["state"] = forced_state
+                            inputs["soft_paywall_warning"] = soft_paywall_warning
+                            inputs["transition_window"] = bool(getattr(state_decision, "transition_window", False))
+                            inputs["transition_reason"] = getattr(state_decision, "transition_reason", None)
+                            n["inputs"] = inputs
+        except Exception:
+            pass
+
+    executor = PlanExecutor(
+        conn=conn,
+        llm=llm,
+        public_user_id=str(public_user_id),
+        conversation_id=str(conversation_id),
+        user_message=str(msg["content"]),
+    )
+
+    final_answer = None
+    exec_final_debug = {}
+    exec_provider_primary = (getattr(orch, "debug", {}) or {}).get("meta", {}).get("provider") or "orchestrated"
+
+    async for ev in executor.run_stream(plan=orch.plan):
+        etype = ev.get("type")
+
+        if etype == "delta":
+            yield {
+                "type": "delta",
+                "text": str(ev.get("text") or ""),
+            }
+            continue
+
+        if etype == "escalate":
+            reason = str(ev.get("reason") or "").strip().lower()
+
+            if reason == "need_web":
+                ctx.setdefault("gates", {})
+                ctx["gates"]["force_need_web"] = True
+            elif reason == "need_docs":
+                ctx.setdefault("gates", {})
+                ctx["gates"]["force_need_docs"] = True
+
+            orchestrator = OrchestratorAgent(llm)
+            ctx["runtime_state"] = {"state": str(getattr(state_decision, "state", "") or "")}
+            orch = await orchestrator.run(user_message=msg["content"], ctx=ctx)
+
+            try:
+                if isinstance(getattr(orch, "plan", None), dict):
+                    for n in orch.plan.get("nodes", []):
+                        if isinstance(n, dict) and n.get("type") == "agent.response_writer":
+                            inputs = n.get("inputs") or {}
+                            if isinstance(inputs, dict):
+                                inputs["route_source"] = "orchestrator"
+                                inputs["runtime_state"] = str(getattr(state_decision, "state", "") or "")
+                                inputs["soft_paywall_warning"] = soft_paywall_warning
+                                inputs["transition_window"] = bool(getattr(state_decision, "transition_window", False))
+                                inputs["transition_reason"] = getattr(state_decision, "transition_reason", None)
+                                n["inputs"] = inputs
+            except Exception:
+                pass
+
+            async for ev2 in executor.run_stream(plan=orch.plan):
+                if ev2.get("type") == "delta":
+                    yield {
+                        "type": "delta",
+                        "text": str(ev2.get("text") or ""),
+                    }
+                elif ev2.get("type") == "error":
+                    yield ev2
+                    return
+                elif ev2.get("type") == "final":
+                    final_answer = ev2.get("answer") or SAFE_FALLBACK_ANSWER
+                    exec_final_debug = ev2.get("debug") or {}
+                    exec_provider_primary = (getattr(orch, "debug", {}) or {}).get("meta", {}).get("provider") or "orchestrated"
+            continue
+
+        if etype == "error":
+            yield ev
+            return
+
+        if etype == "final":
+            final_answer = ev.get("answer") or SAFE_FALLBACK_ANSWER
+            exec_final_debug = ev.get("debug") or {}
+
+    reply_text_raw = final_answer or SAFE_FALLBACK_ANSWER
+    reply_text, flags = extract_and_clean_message_flags(reply_text_raw)
+
+    provider = {
+        "primary": exec_provider_primary,
+        "fallback_used": (orch.ok is False),
+        "orchestrator": {"provider": (getattr(orch, "debug", {}) or {}).get("meta", {}).get("provider")},
+        "flags": flags.to_metadata(),
+        "stream_debug": exec_final_debug,
+    }
+
+    await _persist_onboarding_flags(
+        conn,
+        public_user_id=str(public_user_id),
+        flags_meta=flags.to_metadata(),
+    )
+
+    persisted = await _insert_or_update_assistant_message(
+        conn,
+        conversation_id=str(conversation_id),
+        public_user_id=str(public_user_id),
+        user_message_id=str(user_message_id),
+        reply_text=reply_text,
+        provider=provider,
+        orch=orch,
+    )
+
+    await _postprocess_assistant_message(
+        conn,
+        public_user_id=str(public_user_id),
+        ctx=ctx,
+        provider=provider,
+        msg=msg,
+        conversation_id=str(conversation_id),
+        user_message_id=str(user_message_id),
+        assistant_message_id=str(persisted["assistant_message_id"]),
+    )
+
+    yield {
+        "type": "done",
+        "assistant_message": {
+            "id": persisted["assistant_message_id"],
+            "sent_at": persisted["sent_at"],
+            "content": reply_text,
+        },
+        "provider": provider,
+    }
 
 async def handle_chat_message(
     conn: Connection,
@@ -193,10 +959,20 @@ async def handle_chat_message(
     )
 
     # 4bis) Load context (light) for routing (state_resolver + orchestrator)
-    ctx = await load_context_light(
-        conn,
+    ctx = await load_context_with_billing(
+        conn=conn,
         public_user_id=str(public_user_id),
         conversation_id=str(conversation_id),
+    )
+
+    chat_logger.info(
+        "chat.billing.ctx_loaded",
+        conversation_id=str(conversation_id),
+        public_user_id=str(public_user_id),
+        has_billing=bool((ctx or {}).get("billing")),
+        billing_status=((ctx or {}).get("billing") or {}).get("billing_status"),
+        trial_feedback_context_active=((ctx or {}).get("billing") or {}).get("trial_feedback_context_active"),
+        trial_feedback_context_closed=((ctx or {}).get("billing") or {}).get("trial_feedback_context_closed"),
     )
 
     # -------------------------------------------------
@@ -213,21 +989,52 @@ async def handle_chat_message(
     # injecte le résultat dans ctx pour le resolver
     ctx["onboarding_runtime"] = onboarding_result
 
+    trial_flags = _compute_trial_feedback_flags(ctx or {})
+
+    ctx.setdefault("gates", {})
+    ctx["gates"]["trial_feedback_active"] = trial_flags["trial_feedback_active"]
+    ctx["gates"]["last_lisa_contains_trial_phrase"] = trial_flags["last_lisa_contains_trial_phrase"]
+    ctx["gates"]["billing_status"] = trial_flags["billing_status"]
+    ctx["gates"]["billing_compatible_for_trial_feedback"] = trial_flags["billing_compatible"]
+    ctx["gates"]["trial_feedback_context_active"] = trial_flags["trial_feedback_context_active"]
+    ctx["gates"]["trial_feedback_context_closed"] = trial_flags["trial_feedback_context_closed"]
+    ctx["gates"]["trial_feedback_permanently_closed"] = trial_flags["permanently_closed"]
+
     chat_logger.info(
-        "chat.ctx.loaded",
+        "chat.trial_feedback.flags",
+        conversation_id=str(conversation_id),
+        public_user_id=str(public_user_id),
+        trial_feedback_active=bool(trial_flags["trial_feedback_active"]),
+        last_lisa_contains_trial_phrase=bool(trial_flags["last_lisa_contains_trial_phrase"]),
+        billing_status=trial_flags["billing_status"],
+        billing_compatible=bool(trial_flags["billing_compatible"]),
+        trial_feedback_context_active=bool(trial_flags["trial_feedback_context_active"]),
+        trial_feedback_context_closed=bool(trial_flags["trial_feedback_context_closed"]),
+        trial_feedback_permanently_closed=bool(trial_flags["permanently_closed"]),
+    )
+
+    chat_logger.info(
+        "chat.ctx.loaded.v2",
         conversation_id=str(conversation_id),
         user_message_id=str(user_message_id),
         has_user=bool((ctx or {}).get("user")),
-        locale=((ctx or {}).get("settings") or {}).get("locale_main"),
-        timezone=((ctx or {}).get("settings") or {}).get("timezone"),
-        free_quota_used=((ctx or {}).get("user_status") or {}).get("free_quota_used"),
-        free_quota_limit=((ctx or {}).get("user_status") or {}).get("free_quota_limit"),
-        intro_smalltalk_turns=((ctx or {}).get("gates") or {}).get("user_messages_count"),
-        intro_smalltalk_done=((ctx or {}).get("gates") or {}).get("smalltalk_done_derived"),
-        last_messages_count=len((ctx or {}).get("messages") or []),
+        has_member=bool((ctx or {}).get("member")),
+        has_cabinet=bool((ctx or {}).get("cabinet")),
+        cabinet_name=((ctx or {}).get("cabinet") or {}).get("name"),
+        member_role=((ctx or {}).get("member") or {}).get("role"),
+        member_job_role=((ctx or {}).get("member") or {}).get("job_role"),
+        use_tu_form=((ctx or {}).get("preferences") or {}).get("use_tu_form"),
+        preferred_name=((ctx or {}).get("preferences") or {}).get("preferred_name"),
+        addressing_preference_known=((ctx or {}).get("preferences") or {}).get("addressing_preference_known"),
+        user_facts_count=len((((ctx or {}).get("facts") or {}).get("user_facts") or []),
+        ),
+        cabinet_facts_count=len((((ctx or {}).get("facts") or {}).get("cabinet_facts") or []),
+        ),
+        last_messages_count=len((((ctx or {}).get("history") or {}).get("messages") or [])),
+        intro_sent=bool(((ctx or {}).get("runtime") or {}).get("intro_sent")),
     )
 
-    state_decision = resolve_state(ctx=ctx or {})
+    state_decision = resolve_state_v2(ctx=ctx or {})
 
     gates_decision = apply_gates(ctx=ctx or {})
     soft_paywall_warning = bool(gates_decision.get("soft_paywall_warning"))
@@ -321,8 +1128,8 @@ async def handle_chat_message(
             },
         ]
 
-        # ✅ discovery_pending => docs_chunks obligatoire (AHA message)
-        if state_decision.state == "discovery_pending":
+        # ✅ discovery_capabilities => docs_chunks obligatoire
+        if state_decision.state == "discovery_capabilities":
             scopes = _pick_discovery_doc_scopes(ctx or {})
             chat_logger.info(
                 "chat.discovery.docs_selected",
@@ -340,7 +1147,7 @@ async def handle_chat_message(
             )
 
         # response writer
-        deps = ["A"] + (["S"] if state_decision.state == "discovery_pending" else [])
+        deps = ["A"] + (["S"] if state_decision.state == "discovery_capabilities" else [])
 
         nodes.append(
             {
@@ -470,72 +1277,7 @@ async def handle_chat_message(
         except Exception:
             pass
 
-        # --- Force intent discovery_pending si status=pending (non-fastpath) ---
-        try:
-            settings = (ctx or {}).get("settings") or {}
-            discovery_status = str(settings.get("discovery_status") or "").strip().lower()
 
-            if getattr(state_decision, "state", None) == "discovery" and discovery_status == "pending":
-                # 1) force orch.intent
-                try:
-                    orch.intent = "discovery_pending"
-                except Exception:
-                    pass
-
-                # 2) patch plan: docs_chunks + deps + intent input
-                if isinstance(getattr(orch, "plan", None), dict):
-                    plan = orch.plan
-                    nodes = plan.get("nodes") or []
-                    if isinstance(nodes, list):
-                        has_docs_node = any(
-                            isinstance(n, dict) and n.get("type") == "tool.docs_chunks"
-                            for n in nodes
-                        )
-
-                        if not has_docs_node:
-                            scopes = _pick_discovery_doc_scopes(ctx or {})
-                            docs_node = {
-                                "id": "S",
-                                "type": "tool.docs_chunks",
-                                "depends_on": ["A"],
-                                "inputs": {"scopes": scopes},
-                            }
-
-                            # insert docs node before response_writer if possible
-                            inserted = False
-                            for i, n in enumerate(nodes):
-                                if isinstance(n, dict) and n.get("type") == "agent.response_writer":
-                                    nodes.insert(i, docs_node)
-                                    inserted = True
-                                    break
-                            if not inserted:
-                                nodes.append(docs_node)
-
-                        # ensure response_writer depends on S and intent is discovery_pending
-                        for n in nodes:
-                            if isinstance(n, dict) and n.get("type") == "agent.response_writer":
-                                deps = n.get("depends_on") or []
-                                if not isinstance(deps, list):
-                                    deps = []
-                                if "S" not in deps:
-                                    deps.append("S")
-                                n["depends_on"] = deps
-
-                                inputs = n.get("inputs") or {}
-                                if isinstance(inputs, dict):
-                                    inputs["intent"] = "discovery_pending"
-                                    n["inputs"] = inputs
-
-                        plan["nodes"] = nodes
-                        orch.plan = plan
-
-                        chat_logger.info(
-                            "chat.discovery.pending_forced",
-                            conversation_id=str(conversation_id),
-                            user_message_id=str(user_message_id),
-                        )
-        except Exception as _e:
-            chat_logger.info("chat.discovery.pending_force_error", error=str(_e)[:180])
 
     # 5) Execute plan (tools + response_writer)
     executor = PlanExecutor(
@@ -546,63 +1288,9 @@ async def handle_chat_message(
         user_message=str(msg["content"]),
     )
 
-    # --- Inject docs scopes for discovery_pending (state-based, clean) ---
-    try:
-        needs_docs = (getattr(state_decision, "state", None) == "discovery_pending")
-
-        # si fastpath, ton plan ajoute déjà S => rien à faire
-        if bool(getattr(state_decision, "fastpath_allowed", False)):
-            needs_docs = False
-
-        if needs_docs and isinstance(getattr(orch, "plan", None), dict):
-            plan = orch.plan
-            nodes = plan.get("nodes") or []
-            if isinstance(nodes, list):
-
-                has_docs_node = any(
-                    isinstance(n, dict) and n.get("type") == "tool.docs_chunks"
-                    for n in nodes
-                )
-
-                if not has_docs_node:
-                    scopes = _pick_discovery_doc_scopes(ctx or {})
-
-                    chat_logger.info(
-                        "chat.discovery.docs_injected",
-                        conversation_id=str(conversation_id),
-                        user_message_id=str(user_message_id),
-                        scopes=scopes,
-                    )
-
-                    docs_node = {
-                        "id": "S",
-                        "type": "tool.docs_chunks",
-                        "depends_on": ["A"],
-                        "inputs": {"scopes": scopes},
-                    }
-
-                    inserted = False
-                    for i, n in enumerate(nodes):
-                        if isinstance(n, dict) and n.get("type") == "agent.response_writer":
-                            nodes.insert(i, docs_node)
-                            inserted = True
-                            break
-                    if not inserted:
-                        nodes.append(docs_node)
-
-                    for n in nodes:
-                        if isinstance(n, dict) and n.get("type") == "agent.response_writer":
-                            deps = n.get("depends_on") or []
-                            if not isinstance(deps, list):
-                                deps = []
-                            if "S" not in deps:
-                                deps.append("S")
-                            n["depends_on"] = deps
-
-                    plan["nodes"] = nodes
-                    orch.plan = plan
-    except Exception as _e:
-        chat_logger.info("chat.discovery.docs_inject_error", error=str(_e)[:180])
+    # V2 : aucun patch docs post-plan ici.
+    # Les docs de discovery_capabilities sont injectées directement
+    # au moment de la construction du fastpath.
 
     chat_logger.info(
         "chat.executor.start",
@@ -688,7 +1376,7 @@ async def handle_chat_message(
 
         reply_text_raw = exec_out.get("answer") or SAFE_FALLBACK_ANSWER
 
-        # ✅ Nettoyage des flags de fin de message (aha_moment / onboarding_abort)
+        # ✅ Nettoyage des flags de fin de message (aha_moment / discovery_abort)
         reply_text, flags = extract_and_clean_message_flags(reply_text_raw)
 
         orch_provider = (getattr(orch, "debug", {}) or {}).get("meta", {}).get("provider")
@@ -714,7 +1402,16 @@ async def handle_chat_message(
     except Exception as e:
         # filet de sécurité ultime
         reply_text = "Désolé — j’ai eu un souci technique. Réessaie dans quelques secondes."
-        provider = {"primary": "error_fallback", "fallback_used": True, "error": str(e)[:160], "flags": {"aha_moment": False, "onboarding_abort": False}}
+        provider = {
+            "primary": "error_fallback",
+            "fallback_used": True,
+            "error": str(e)[:160],
+            "flags": {
+                "aha_request": False,
+                "aha_moment": False,
+                "discovery_abort": False,
+            },
+        }
 
         chat_logger.error(
             "chat.executor.error",
@@ -782,128 +1479,30 @@ async def handle_chat_message(
 
     assistant_message_id = str(inserted["id"])
 
-    # ✅ Post-actions (AHA request / AHA moment / abort) — best effort, ne casse pas le chat
-    try:
-        flags_meta = provider.get("flags", {}) or {}
-
-        # 1) Dès que Lisa POSE la question de démo => on passe pending
-        if flags_meta.get("aha_request") is True:
-            await conn.execute(
-                """
-                update public.user_settings
-                set discovery_status = 'pending'
-                where user_id = $1
-                and coalesce(discovery_status, 'to_do') in ('to_do', '')
-                """,
-                public_user_id,
-            )
-
-        # 2) Si user dit OUI (aha_moment) => complete
-        if flags_meta.get("aha_moment") is True:
-            await conn.execute(
-                """
-                update public.user_settings
-                set discovery_status = 'complete',
-                    discovery_completed_at = now()
-                where user_id = $1
-                """,
-                public_user_id,
-            )
-
-        # 3) Si user dit NON (abort) => aborted (sauf si déjà complete)
-        elif flags_meta.get("onboarding_abort") is True:
-            await conn.execute(
-                """
-                update public.user_settings
-                set discovery_status = 'aborted'
-                where user_id = $1
-                and coalesce(discovery_status,'pending') <> 'complete'
-                """,
-                public_user_id,
-            )
-
-    except Exception as _e:
-        chat_logger.info("chat.flags.persist_error", error=str(_e)[:180])
-
-    chat_logger.info(
-        "chat.persisted",
-        conversation_id=str(conversation_id),
-        user_message_id=str(user_message_id),
-        assistant_message_id=str(assistant_message_id),
+    await _persist_onboarding_flags(
+        conn,
+        public_user_id=str(public_user_id),
+        flags_meta=provider.get("flags", {}) or {},
     )
-
-    # ✅ Persist smalltalk state (business rule)
-    smalltalk_done_derived = False
-    user_messages_count = 0
-    discovery_status_now = ""
-
-    # ✅ Onboarding progression (DB-side deterministic)
-    try:
-        onboarding_ctx = (ctx or {}).get("onboarding") or {}
-        action_ctx = (ctx or {}).get("action_state") or {}
-
-        has_paid_active = bool(((ctx or {}).get("user_status") or {}).get("is_pro"))
-        discovery_status_now = str(
-            ((ctx or {}).get("settings") or {}).get("discovery_status") or ""
-        ).strip().lower()
-
-        await conn.execute(
-            "select public.fn_update_onboarding_progress($1, $2, $3)",
-            public_user_id,
-            has_paid_active,
-            discovery_status_now,
-        )
-
-    except Exception as _e:
-        chat_logger.info("chat.onboarding.progress_error", error=str(_e)[:180])
-
-    try:
-        gates = (ctx or {}).get("gates") or {}
-        smalltalk_done_derived = bool(gates.get("smalltalk_done_derived"))
-        user_messages_count = int(gates.get("user_messages_count") or 0)
-        discovery_status_now = str(gates.get("discovery_status") or "").strip().lower()
-
-        await conn.execute(
-            """
-            update public.user_settings
-            set intro_smalltalk_done = $2,
-                intro_smalltalk_turns = greatest(coalesce(intro_smalltalk_turns, 0), $3)
-            where user_id = $1
-            """,
-            public_user_id,
-            smalltalk_done_derived,
-            user_messages_count,
-        )
-    except Exception as _e:
-        chat_logger.info("chat.smalltalk.persist_error", error=str(_e)[:180])
-
-    # ✅ Safety net : au 15e message user, si discovery pas démarré => pending forcé
-    try:
-        if smalltalk_done_derived and user_messages_count >= 15 and discovery_status_now in ("to_do", "", "null", "none"):
-            await conn.execute(
-                """
-                update public.user_settings
-                set discovery_status = 'pending'
-                where user_id = $1
-                and coalesce(discovery_status, 'to_do') in ('to_do', '')
-                """,
-                public_user_id,
-            )
-    except Exception as _e:
-        chat_logger.info("chat.discovery.force_pending_error", error=str(_e)[:180])
 
     # 6bis) Fire-and-forget user facts catcher (must not impact chat latency)
     chat_logger.info("userfacts.hook.before", conversation_id=str(conversation_id), user_message_id=str(user_message_id))
 
     try:
         payload = {
+            "source": "chat_message",
             "public_user_id": str(public_user_id),
             "conversation_id": str(conversation_id),
+            "conversation_channel": ((ctx or {}).get("conversation") or {}).get("channel"),
             "user_message_id": str(user_message_id),
             "assistant_message_id": str(assistant_message_id),
             "user_text": (msg["content"] or ""),
+            "assistant_text": reply_text,
             "locale": ((ctx or {}).get("settings") or {}).get("locale_main"),
             "timezone": ((ctx or {}).get("settings") or {}).get("timezone"),
+            "cabinet_account_id": ((ctx or {}).get("cabinet") or {}).get("id"),
+            "member_role": ((ctx or {}).get("member") or {}).get("role"),
+            "member_job_role": ((ctx or {}).get("member") or {}).get("job_role"),
         }
 
         chat_logger.info("userfacts.hook.payload_ready", public_user_id=str(public_user_id))

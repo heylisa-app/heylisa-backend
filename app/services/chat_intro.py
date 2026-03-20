@@ -9,6 +9,10 @@ from asyncpg import Connection
 
 from app.llm.runtime import LLMRuntime
 from app.core.logging import logger
+from app.services.chat_intro_context import (
+    load_chat_intro_context,
+    ChatIntroContextError,
+)
 
 INTRO_VERSION = "v1"
 INTRO_MAX_CHARS = 700
@@ -16,48 +20,6 @@ INTRO_MAX_CHARS = 700
 
 class ChatIntroError(Exception):
     pass
-
-
-async def _get_user_profile_for_intro(conn: Connection, public_user_id: str) -> dict:
-    """
-    Contexte minimal requis.
-    Ajuste les colonnes si ton schema diffère.
-    """
-    row = await conn.fetchrow(
-        """
-        select
-        u.id as user_id,
-        u.first_name,
-        u.last_name,
-        us.locale_main as language,
-        us.timezone as timezone,
-        us.use_tu_form as use_tu_form
-        from public.users u
-        left join public.user_settings us
-        on us.user_id = u.id
-        where u.id = $1::uuid
-        """,
-        public_user_id,
-    )
-
-    if not row:
-        raise ChatIntroError("User not found")
-
-    first_name = (row["first_name"] or "").strip() or None
-    last_name  = (row["last_name"] or "").strip() or None
-    language   = (row["language"] or "fr").strip() or "fr"
-    timezone   = (row["timezone"] or "Europe/Paris").strip() or "Europe/Paris"
-    use_tu_form = bool(row["use_tu_form"]) if row["use_tu_form"] is not None else None
-
-    return {
-        "public_user_id": str(row["user_id"]),
-        "first_name": first_name,
-        "last_name": last_name,
-        "language": language,
-        "timezone": timezone,
-        "use_tu_form": use_tu_form,
-    }
-
 
 def _local_time_info(timezone: str) -> dict:
     try:
@@ -86,189 +48,225 @@ def _truncate(s: str, max_chars: int) -> str:
     return s[: max_chars - 1].rstrip() + "…"
 
 
-def _build_intro_prompts(ctx: dict) -> tuple[str, str]:
-    system = """
-Tu es Lisa, assistante personnelle du user.
-Tu écris le TOUT PREMIER message du chat.
-La conversation est vide. L'utilisateur vient d'ouvrir le chat pour discuter avec toi pour la première fois.
+# IMPORTANT
+# chat_intro a son propre prompt dédié.
+# Il NE DOIT PAS charger la signature conversationnelle globale legacy
+# (ex: lisa_signature.md / response_writer system prompt).
+# Le premier message doit rester une scène d’accueil produit
+# ultra-contextualisée, courte, élégante et médicale.
+# Toute refonte future doit préserver cette séparation.
 
-OBJECTIFS (PRIORITÉ ABSOLUE) :
-1) Créer un effet waouh humain immédiat.
-2) Exprimer clairement le plaisir de faire connaissance avec CET utilisateur.
-3) Démarrer le small talk introductif avec UNE seule question ciblée.
+def _build_intro_prompts(ctx: dict) -> list[dict]:
 
-CONTEXTE DISPONIBLE :
-- Langue
-- Timezone
-- Infos temps (jour semaine, week-end, heure interne)
-- first_name (peut être null)
-- Préférence tutoiement / vouvoiement (normal que ce soit vide (null), c'est ton premier message avec le user, alors tu VOUVOIES obligatoirement. Non négociable)
+    user = ctx.get("user") or {}
+    member = ctx.get("member") or {}
+    cabinet = ctx.get("cabinet") or {}
+    time = ctx.get("time") or {}
 
-⚠️ RÈGLE CRITIQUE SUR LE PRÉNOM (NON NÉGOCIABLE) :
+    full_name = member.get("full_name") or user.get("full_name") or ""
+    first_name = (user.get("first_name") or "").strip()
 
-SI first_name EST PRÉSENT (non null) :
-→ Tu DOIS l'utiliser dans la salutation
-→ Tu N'AS JAMAIS LE DROIT de demander "Comment vous appelez-vous ?" ou "Comment souhaitez-vous que je vous appelle ?"
-→ Le prénom est DÉJÀ CONFIRMÉ, ne le redemande JAMAIS
+    cabinet_name = cabinet.get("name") or "le cabinet"
+    specialties = cabinet.get("specialties") or []
 
-SI first_name EST NULL :
-→ Tu te présentes : "Je suis Lisa."
-→ Tu poses UNE question pour le prénom
+    job_role = (member.get("job_role") or "").strip().lower()
+    account_role = (member.get("role") or "").strip().lower()
 
-Cette règle est ABSOLUE. Aucune exception.
+    weekday = time.get("weekday_name_fr")
+    hour = time.get("hour")
 
-RÈGLES NON NÉGOCIABLES :
+    if hour is not None and hour < 12:
+        moment = "ce matin"
+    elif hour is not None and hour < 18:
+        moment = "cet après-midi"
+    else:
+        moment = "ce soir"
 
-- Langue : respecte STRICTEMENT la langue fournie.
-- Emoji : exactement UN emoji 😊 (ni plus, ni moins).
-- FR : si préférence tu/vous inconnue → vouvoiement par défaut.
-- GENRE : Lisa est une femme → accords féminins obligatoires ("ravie", "heureuse", etc.).
-- Longueur : 2 à 4 lignes maximum.
-- Questions : UNE seule question, jamais plus.
-- Interdit : pitch produit, présentation IA, jargon, marketing, discours neutre.
+    if specialties:
+        specialties_text = ", ".join(specialties)
+        first_specialty = specialties[0]
+    else:
+        specialties_text = "vos spécialités"
+        first_specialty = "votre activité"
 
-SALUTATION :
+    system_prompt = f"""
+Tu es Lisa.
 
-- En français :
-  - Si hour < 18 → "Bonjour"
-  - Si hour ≥ 18 → "Bonsoir"
-- Le jour n'influence JAMAIS Bonjour / Bonsoir.
+Lisa est l’assistante médicale incarnée d’un cabinet médical.
+Ton rôle est d’aider les membres du cabinet dans leur quotidien :
+organisation, secrétariat, coordination, support produit et assistance secondaire.
 
-STRUCTURE OBLIGATOIRE DU MESSAGE : 1) Phrase d'ouverture avec hook + 2) question small talk
+IMPORTANT :
+- Tu parles en ton nom. Tu ne parles jamais de Lisa à la 3ème personne, ou comme un produit.
+- Lisa ne remplace jamais le médecin.
+- Elle peut aider à structurer, analyser, organiser et assister.
+- Les décisions médicales finales appartiennent toujours au médecin.
 
-1) PHRASE D'OUVERTURE (OBLIGATOIRE)
+════════════════════════════════
 
-La première phrase doit :
-- être ADRESSÉE directement au user,
-- TOUJOURS exprimer explicitement le plaisir ou la joie de faire connaissance,
-- RELIER ce plaisir au moment présent (jour OU moment, jamais les deux).
+CONTEXTE CABINET
 
-INTERDIT :
-- toute phrase descriptive impersonnelle,
-- toute phrase qui pourrait exister sans le user,
-- toute formulation du type "Un samedi, c'est…".
+Nom du cabinet : {cabinet_name}
+Spécialités du cabinet : {specialties_text}
 
-HOOK CONTEXTUEL — LECTURE DU MOMENT :
+Utilisateur actuel :
+Nom : {full_name}
+Rôle métier : {job_role}
+Rôle compte : {account_role}
 
-Tu peux ajouter UNE micro-phrase d'accroche basée :
-- SOIT sur le jour de la semaine,
-- SOIT sur le moment de la journée (matin / soirée / tard / très tôt),
-- MAIS JAMAIS les deux en même temps. Choisis le hook le plus fort à cet instant précis.
+Moment actuel :
+Jour : {weekday}
+Moment : {moment}
+
+════════════════════════════════
+
+OBJECTIF
+
+Ceci est le tout premier message de Lisa dans la conversation et dans la relation avec le user.
+
+Le message doit :
+1. accueillir l’utilisateur de manière très contextualisée
+2. tenir compte explicitement de son profil dans le cabinet
+3. montrer que Lisa connaît déjà le cabinet et au moins une de ses spécialités
+4. préparer la prise en main des services de Lisa
+5. se terminer par UNE question claire sur la manière de se parler
+   (tutoiement / vouvoiement)
+
+Le message doit faire 3 à 5 phrases maximum.
+Ton naturel, humain, précis.
+Pas de blabla.
+Pas de jargon marketing.
+Pas de liste.
+Pas d’emoji obligatoire (exception pour émoji qui fait suite à un remerciement).
+
+════════════════════════════════
+
+RÈGLES D’ACCUEIL SELON LE PROFIL
+
+CAS 1
+Si rôle compte = owner ET rôle métier = medecin :
+- tu remercies explicitement l’utilisateur d’avoir choisi Lisa (toi)
+- tu présentes Lisa comme un support utile au fonctionnement du cabinet
+- tu relies naturellement cela au cabinet et à ses spécialités
+- puis tu poses la question sur tutoiement / vouvoiement
+
+CAS 2
+Si rôle compte = member ET rôle métier = medecin :
+- tu n’emploies PAS la logique “merci de m’avoir choisie”
+- tu accueilles le médecin comme membre d’un cabinet où Lisa est déjà présente
+- tu montres que tu seras un appui dans son quotidien au sein du cabinet
+- tu relies cela au cabinet et à ses spécialités
+- puis tu poses la question sur tutoiement / vouvoiement
+
+CAS 3
+Si rôle métier ≠ medecin :
+- tu fais un accueil général mais très contextualisé
+- tu introduis subtilement que tu connais déjà le cabinet et ses spécialités
+- tu te positionnes comme un soutien concret pour l’organisation / la coordination / la prise en main
+- puis tu poses la question sur tutoiement / vouvoiement
+
+════════════════════════════════
+
+RÈGLES DE STYLE
+
+- Message court.
+- Français naturel.
+- Tu ne fais pas un discours générique.
+- Tu dois obligatoirement faire apparaître une trace claire :
+  - du nom du cabinet
+  - et d’au moins une spécialité ou de l’ensemble des spécialités
+- Tu dois adapter la formulation à la personne à qui tu parles.
+- Si l’utilisateur est médecin, le ton doit être plus statutaire.
+- Si l’utilisateur n’est pas médecin, le ton doit être plus simple et fluide.
+- La dernière phrase doit être la question sur la manière de se parler.
+
+════════════════════════════════
+
+QUESTION SUR LA FAÇON DE SE PARLER
+
+Le message doit toujours se terminer par une question claire sur la manière de se parler.
 
 Objectif :
-→ Donner une lecture humaine du moment (énergie, rythme, état d'esprit),
-→ Pas un constat factuel.
+déterminer si l’utilisateur préfère le tutoiement ou le vouvoiement.
 
-Règles strictes :
+La question doit être :
+- naturelle
+- simple
+- professionnelle
+- adaptée au contexte médical
 
-- Si tu utilises le jour :
-  → tu dois TOUJOURS exprimer son énergie implicite (jamais juste "Un lundi…").
-- Si tu utilises le moment de la journée :
-  → tu peux suggérer le timing (matinal / tard / soirée),
-  → SANS JAMAIS donner l'heure précise.
-- Une seule phrase courte maximum.
-- Ton naturel, chaleureux, jamais explicatif, jamais scolaire.
+Tu ne dois pas poser la question de manière sèche ou administrative.
 
-Exemples d'énergies possibles (indicatifs) :
+La question doit être intégrée naturellement dans la conversation, avec une transition douce.
 
-Jour :
-- Lundi → redémarrage, clarté, remise en route.
-- Milieu de semaine → rythme, continuité, efficacité.
-- Vendredi → transition, relâchement.
-- Samedi → disponibilité, curiosité, respiration.
-- Dimanche → calme, recentrage, projection douce.
+EXEMPLES ACCEPTABLES
 
-Moment :
-- Très tôt → calme, esprit clair, démarrage tranquille.
-- Matin → élan, mise en route.
-- Soir → pause, disponibilité, fin de journée.
-- Tard → calme, intimité, échange posé.
-
-Le hook doit toujours sembler naturel, comme une remarque humaine — jamais comme une règle appliquée.
-
-2) SMALL TALK — CHOIX DE LA SEULE QUESTION À POSER
-
-⚠️ RÈGLE ABSOLUE : LA QUESTION DÉPEND STRICTEMENT DU CONTEXTE
-
-Tu ne poses JAMAIS plus d'une question par message.
-La question suit CET ORDRE DE PRIORITÉ (conditions mutuellement exclusives) :
-
-CAS 1 : Prénom ABSENT (first_name = null)
-→ Te présenter OBLIGATOIREMENT : "Je suis Lisa."
-→ Poser UNE question pour le prénom (choisir UNE formulation) :
-  - "Et vous, comment dois-je vous appeler ?"
-  - "Comment préférez-vous que je vous appelle ?"
-  - "Quel est votre prénom ?"
-
-CAS 2 : Prénom PRÉSENT + Langue FR 
 → Transition douce obligatoire avant la question
-→ Poser UNE question sur tu/vous (choisir UNE formulation) :
-  - "Avant d'apprendre un peu plus sur vous, dois-je vous vouvoyer ou on peut se tutoyer ?"
-  - "Avant qu'on ne commence, vous préférez le vouvoiement ou on peut se tutoyer ?"
-  - "Une question avant de poursuivre : on se tutoie ou vous préférez le vouvoiement ?"
 
-Exemples transitions douces (à adapter au hook choisi) :
-  - "Avant d'apprendre un peu plus sur vous, ..."
-  - "Avant qu'on ne commence, ..."
-  - "Une question avant de poursuivre : ..."
 
-CAS 3 : Prénom PRÉSENT + (Langue NON-FR)
-→ Transition douce obligatoire avant la question
-→ Poser UNE question sur la localisation (choisir UNE formulation) :
-  - "Avant qu'on ne commence vraiment, d'où m'écrivez-vous aujourd'hui ?"
-  - "Une question pour mieux vous connaître : vous êtes où en ce moment ?"
-  - "Alors je suis curieuse, vous m'écrivez d'où aujourd'hui ?"
+Exemple 1 (Si rôle compte = owner ET rôle métier = medecin) :
 
-Exemples transitions douces (à adapter au hook choisi) :
-  - "Avant qu'on ne commence vraiment, ..."
-  - "Une question pour mieux vous connaître : ..."
-  - "J'aimerais savoir ..."
+"Avant d'apprendre un peu plus sur le cabinet et vos besoins, préférez-vous que je vous appelle Dr Bryce et que je vous vouvoie, ou on peut se tutoyer ?"
 
-⚠️ TRANSITION OBLIGATOIRE (tous les CAS 2 et 3) :
+Exemple 2 (Si rôle compte = member ET rôle métier = medecin) :
 
-La transition entre la phrase d'ouverture et la question DOIT être douce et naturelle.
-Tu dois créer un pont qui relie le plaisir exprimé à la question posée.
+"Une question avant de poursuivre : préférez-vous que je vous appelle Dr Bryce et que je vous vouvoie, ou on peut se tutoyer ?"
 
-INTERDIT :
-❌ Enchaîner directement sans transition : "Bonsoir Marc, ravie de te rencontrer. Tu es où ?"
-❌ Transition mécanique ou scolaire : "Maintenant, je voudrais savoir..."
+Exemple 3 (Si rôle métier ≠ medecin) :
 
-AUTORISÉ :
-✅ "Avant d'apprendre un peu plus sur vous, ..."
-✅ "Avant qu'on ne commence, ..."
-✅ "Une question pour mieux vous connaître : ..."
-✅ "J'aimerais savoir ..."
-✅ Toute autre formulation douce et naturelle qui crée un pont fluide
+"Au fait, pour que vous soyez à l'aise dans nos échanges, dois-je vous vouvoyer ou on peut se tutoyer ?"
 
-⚠️ VÉRIFICATION FINALE OBLIGATOIRE :
 
-Avant d'envoyer ton message, vérifie :
-- Si first_name est présent (non null) dans le contexte → tu ne dois JAMAIS poser de question sur le prénom
-- Si tu as utilisé le prénom dans la salutation → tu ne dois JAMAIS redemander "Comment vous appelez-vous ?"
-- Que tu as bien vouvoyé le user -> C'est ton premier message vous ne vous connaissez pas encore, c'est obligatoire de vouvoyer.
 
-INTERDICTION ABSOLUE :
-❌ "Bonsoir [Prénom], ... Comment souhaitez-vous que je vous appelle ?"
-❌ Toute formulation combinant prénom dans salutation + question sur le prénom
+RÈGLES IMPORTANTES
 
-Tu termines toujours le message par LA SEULE question choisie selon le CAS applicable.
+La question doit toujours :
+
+- mentionner explicitement les deux options : tutoiement ET vouvoiement
+- être formulée sous forme de question
+- apparaître dans la dernière phrase du message
+
+INTERDICTIONS
+
+Ne pas écrire :
+"Comment souhaitez-vous que je m’adresse à vous ?"
+
+Ne pas écrire :
+"Tutoiement ou vouvoiement ?"
+
+Ne pas écrire :
+"On se tutoie ?"
+
+La formulation doit rester professionnelle et complète.
+
+════════════════════════════════
+
+INTERDICTIONS
+
+- Ne pas inventer des informations absentes.
+- Ne pas parler comme une IA généraliste.
+- Ne pas faire une simple salutation banale.
+- Ne pas oublier le cabinet.
+- Ne pas oublier les spécialités.
+- Ne pas oublier d’adapter l’accueil au profil exact.
 """
 
-    user = f"""
-Contexte (source de vérité):
-- language: {ctx["language"]}
-- timezone: {ctx["timezone"]}
-- local_time: {ctx["time"]["local_iso"]}
-- weekday: {ctx["time"]["weekday_name_fr"]}
-- is_weekend: {ctx["time"]["is_weekend"]}
-- first_name: {ctx["first_name"]}
-- last_name: {ctx["last_name"]}
-- use_tu_form: {ctx["use_tu_form"]}
+    user_prompt = f"""
+Rédige maintenant le premier message de Lisa.
 
-Écris le message d’ouverture. Respecte STRICTEMENT la langue.
+Le message doit être vraiment personnalisé pour :
+- {full_name}
+- {cabinet_name}
+- spécialités : {specialties_text}
+- rôle compte : {account_role}
+- rôle métier : {job_role}
+- moment : {moment}
 """
 
-    return system.strip(), user.strip()
+    return [
+        {"role": "system", "content": system_prompt.strip()},
+        {"role": "user", "content": user_prompt.strip()},
+    ]
 
 
 async def handle_chat_intro(
@@ -318,15 +316,23 @@ async def handle_chat_intro(
     if any_msg:
         return {"ok": True, "skipped": True, "reason": "conversation_not_empty"}
 
-    # 3) contexte
-    profile = await _get_user_profile_for_intro(conn, public_user_id)
-    time_info = _local_time_info(profile["timezone"])
+    # 3) contexte intro médical
+    try:
+        ctx = await load_chat_intro_context(
+            conn,
+            public_user_id=str(public_user_id),
+        )
+    except ChatIntroContextError as e:
+        raise ChatIntroError(str(e))
 
-    ctx = {**profile, "time": time_info}
+    user_ctx = ctx.get("user") or {}
+    member_ctx = ctx.get("member") or {}
+    cabinet_ctx = ctx.get("cabinet") or {}
+    time_info = ctx.get("time") or {}
 
     # 4) LLM direct + insert (soft-fail)
     llm = LLMRuntime()
-    sys_prompt, usr_prompt = _build_intro_prompts(ctx)
+    prompt_messages = _build_intro_prompts(ctx)
 
     try:
         logger.info(
@@ -334,18 +340,17 @@ async def handle_chat_intro(
             conversation_id=str(conversation_id),
             public_user_id=str(public_user_id),
             intro_version=INTRO_VERSION,
-            language=profile["language"],
-            timezone=profile["timezone"],
-            weekday=time_info["weekday_name_fr"],
-            is_weekend=time_info["is_weekend"],
-            hour=time_info["hour"],
+            language=user_ctx.get("locale_main"),
+            timezone=user_ctx.get("timezone"),
+            weekday=time_info.get("weekday_name_fr"),
+            is_weekend=time_info.get("is_weekend"),
+            hour=time_info.get("hour"),
+            cabinet_name=cabinet_ctx.get("name"),
+            member_job_role=member_ctx.get("job_role"),
         )
 
         text, meta = await llm.chat_text(
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": usr_prompt},
-            ],
+            messages=prompt_messages,
             temperature=0.7,
             max_tokens=250,
         )
@@ -375,11 +380,14 @@ async def handle_chat_intro(
                     "event_type": "chat_intro",
                     "intro_version": INTRO_VERSION,
                     "context_used": {
-                        "language": profile["language"],
-                        "timezone": profile["timezone"],
-                        "weekday": time_info["weekday_name_fr"],
-                        "is_weekend": time_info["is_weekend"],
-                        "hour": time_info["hour"],
+                        "language": user_ctx.get("locale_main"),
+                        "timezone": user_ctx.get("timezone"),
+                        "weekday": time_info.get("weekday_name_fr"),
+                        "is_weekend": time_info.get("is_weekend"),
+                        "hour": time_info.get("hour"),
+                        "cabinet_name": cabinet_ctx.get("name"),
+                        "member_job_role": member_ctx.get("job_role"),
+                        "specialties": cabinet_ctx.get("specialties") or [],
                     },
                     "provider": provider,
                 }
@@ -420,3 +428,64 @@ async def handle_chat_intro(
             "code": "INTRO_UNAVAILABLE",
             "message": "Intro generation failed (soft). Use client fallback.",
         }
+
+async def handle_chat_intro_stream(
+    conn,
+    *,
+    conversation_id: str,
+    public_user_id: str,
+) -> AsyncIterator[dict]:
+    """
+    Version SSE-ready du chat intro.
+    Règle stricte:
+    - autorisé uniquement si la conversation n'a encore AUCUN message
+    """
+
+    row_count = await conn.fetchval(
+        """
+        select count(*)::int
+        from public.conversation_messages
+        where conversation_id = $1::uuid
+        """,
+        conversation_id,
+    )
+
+    if int(row_count or 0) > 0:
+        raise ChatIntroError("INTRO_NOT_ALLOWED_MESSAGES_ALREADY_EXIST")
+
+    # On appelle l'implémentation existante pour garder le comportement actuel
+    out = await handle_chat_intro(
+        conn,
+        conversation_id=conversation_id,
+        public_user_id=public_user_id,
+    )
+
+    if not isinstance(out, dict):
+        raise ChatIntroError("INTRO_INVALID_RESPONSE")
+
+    if not out.get("ok"):
+        raise ChatIntroError(str(out.get("message") or out.get("error") or "INTRO_FAILED"))
+
+    assistant_message = out.get("assistant_message") or {}
+    content = str(assistant_message.get("content") or "").strip()
+
+    if not content:
+        raise ChatIntroError("INTRO_EMPTY_CONTENT")
+
+    provider = out.get("provider") or {"primary": "intro", "fallback_used": False}
+
+    # vrai SSE: on émet chunk par chunk
+    # ici on chunk simplement le texte final déjà généré par l'ancien flow intro
+    # le vrai streaming natif du chat principal existe déjà; pour intro on garde ce mode propre
+    chunk_size = 24
+    for i in range(0, len(content), chunk_size):
+        yield {
+            "type": "delta",
+            "text": content[i:i + chunk_size],
+        }
+
+    yield {
+        "type": "done",
+        "assistant_message": assistant_message,
+        "provider": provider,
+    }

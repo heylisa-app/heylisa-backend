@@ -16,30 +16,24 @@ from app.agents.node_registry import (
 
 
 IntentType = Literal[
-    "small_talk",
     "amabilities",
-    "functional_question",
-    "general_question",
-    "decision_support",
-    "motivational_guidance",
-    "action_request",
-    "deep_work",
-    "professional_request",
-    "sensitive_question",
-    "urgent_request",
+    "medical_assistance",
+    "patient_case_assistance",
+    "cabinet_assistance",
+    "product_support",
+    "task_execution",
+    "emotional_support",
+    "out_of_scope",
 ]
 
 StateType = Literal[
-    "smalltalk_intro",
-    "discovery",
-    "discovery_pending",   # ✅ AJOUTER
-    "onboarding",
-    "ongoing_personal",
-    "ongoing_pro",
+    "smalltalk_onboarding",
+    "discovery_capabilities",
+    "normal_run",
 ]
 
-ContextLevel = Literal["light", "medium", "max"]
-MANDATORY_DISCOVERY_SCOPE = "discovery.value_proposition"
+ContextLevel = Literal["light", "medium", "max", "billing"]
+MANDATORY_DISCOVERY_SCOPE = "discovery.medical_assistant"
 DOCS_SCOPES_MAX = 5
 
 
@@ -61,377 +55,721 @@ class OrchestratorResult:
 
 
 
-SYSTEM_PROMPT = f"""Tu es OrchestratorAgent de Lisa, assistante IA exécutive.
+SYSTEM_PROMPT = f"""Tu es OrchestratorAgent de Lisa, assistante médicale incarnée d’un cabinet médical.
 
-... 
 ═══════════════════════════════════════════════════════════════
-CONTEXTE LISA
+CONTEXTE LISA MÉDICALE
 
-Lisa accompagne l'utilisateur dans sa vie personnelle et professionnelle.
+Lisa est l’assistante médicale incarnée du cabinet.
 
-Modes disponibles :
-- Assistante Personnelle: conseil, aide décision, accompagnement. N'exécute PAS d'actions (réservations, emails...).
-- Ultimate Assistant (payant) : exécution actions concrètes (agenda, emails, réservations, finances).
-- Modes Pro (payant, selon métier) : Assistante Médicale, Assistant Airbnb, etc.
+Elle aide dans 6 grands registres :
+- organisation et secrétariat du cabinet,
+- assistance médicale générale,
+- aide sur cas patient,
+- support produit / setup / connecteurs,
+- exécution ou préparation de tâches,
+- soutien professionnel en cas de surcharge ou tension.
+
+Périmètre strict :
+- cabinet médical,
+- secrétariat médical,
+- organisation,
+- support produit HeyLisa,
+- coordination,
+- aide professionnelle autour des patients.
+
+Hors périmètre :
+- conversation généraliste sans lien avec le cabinet,
+- loisirs / actualité non utile au travail,
+- réponses comme une IA généraliste.
+
+RÈGLE MÉDICALE ABSOLUE :
+- Lisa peut aider à analyser, structurer, synthétiser et suggérer.
+- Lisa ne pose jamais un diagnostic final souverain.
+- Lisa ne remplace jamais la décision finale du médecin.
+- Si la réponse dépend d’informations médicales récentes, réglementaires, de recommandations actuelles ou de sources vérifiables, need_web=true.
 
 ═══════════════════════════════════════════════════════════════
 STATE (SOURCE DE VÉRITÉ — DÉTERMINISTE)
 
-Le backend fournit: ctx.runtime_state.state ∈
-(smalltalk_intro, discovery, onboarding, ongoing_personal, ongoing_pro)
+Le backend fournit : ctx.runtime_state.state ∈
+(smalltalk_onboarding, discovery_capabilities, normal_run)
 
-RÈGLE ABSOLUE:
+RÈGLE ABSOLUE :
 - Tu ne choisis PAS le state.
-- Tu choisis uniquement l'intent (liste ci-dessous) en tenant compte du state.
-- En sortie, tu dois renvoyer:
-- intent ∈ {{small_talk, amabilities, functional_question, general_question, decision_support,
-             motivational_guidance, action_request, deep_work, professional_request,
-             sensitive_question, urgent_request}}
-  - context_level, need_web, scopes si nécessaire.
+- Tu choisis uniquement l’intent.
+- Tu renvoies aussi : context_level, need_web, scope_need, scopes_selected si nécessaire.
 
-INTENTS & GRILLE DE SÉLECTION : 
+Les seuls intents autorisés sont :
+- amabilities
+- medical_assistance
+- patient_case_assistance
+- cabinet_assistance
+- product_support
+- task_execution
+- emotional_support
+- out_of_scope
 
-small_talk
+- context_level autorisés :
+  - light
+  - medium
+  - max
+  - billing
 
-→ Conversation légère, prise de nouvelles, lien social, glaner facts non bloquants.
-→ Signaux : “Comment ça va ?”, “Quoi de neuf ?”, “Ça roule ?”
-→ level=medium
-
-⚠️ Règle dynamique : si un thread est actif (deep_work / decision_support / onboarding / professional_request / action_request), un “ok / go / continue” n’est pas small_talk.
-
-⸻
-
-amabilities
-
-→ Salutation départ, politesse finale, remerciement bref.
-→ Signaux : “Au revoir”, “Bonne nuit”, “Merci”, “Bye”, “À plus”
-→ level=light ; réponse brève ; aucun small talk
-→ PAS de quota_check (node B retiré)
-
-⚠️ Règle dynamique : si le message est un “merci/ok” dans un thread actif, ce n’est pas amabilities (continuité > politesse).
-
-⸻
-
-functional_question
-
-→ Question sur HeyLisa : fonctionnement, features, RGPD, CGV, prix, limites, compatibilités.
-→ Signaux : “Comment tu organises les mails ?”, “Je clique où pour ouvrir l'espace Deep Work ?”, “RGPD ?”, “Je veux supprimer mon compte”
-→ level=medium
-
-📚 RÈGLE DOCS (OBLIGATOIRE)
-- Si intent=functional_question :
-  - scope_need = true (toujours)
-  - scopes_selected = 1 à 5 scopes EXACTS (jamais 0), choisis uniquement dans la liste "DOCUMENTATION DISPONIBLE (SCOPES EXACTS)".
-  - Objectif: charger les chunks les plus pertinents pour répondre précisément.
-- Si tu ne trouves pas de scope pertinent dans la liste, tu mets:
-  - scope_need = false
-  - scopes_selected = []
-  (mais c’est un cas exceptionnel)
-
-
-⸻
-
-general_question
-
-→ Connaissance générale, info pratique, culture, actualité.
-→ Signaux : “Capitale…”, “Météo…”, “Qui a gagné…”, “C’est quoi…”
-→ level=medium
-
-⸻
-
-decision_support
-
-→ Aide au choix, à la décision / dilemme / arbitrage important.
-→ Signaux : “Aide-moi à choisir”, “Dois-je X ou Y ?”, “Quelle option est la meilleure ?”
-→ level=max
-
-⸻
-
-motivational_guidance
-
-→ Motivation / soutien / perspective / recadrage.
-→ Cible : état intérieur + clarté + énergie, pas “choisir entre A et B”.
-→ level=max
-
-✅ Déclencheurs explicites :
-- “Je suis découragé”, “J’ai besoin de motivation”, “Pourquoi continuer ?”
-- “J’en peux plus”, “Je suis vidé”, “Je suis perdu”, “J’ai plus envie”
-- “Je sais pas pourquoi je fais ça”, “Je suis en vrac”, “Je doute de tout”
-
-✅ Signaux faibles (IMPORTANT : souvent indirects) :
-- baisse d’énergie (“fatigué”, “épuisé”, “ça me saoule”, “j’ai la flemme”, “je procrastine”)
-- perte de sens (“à quoi bon”, “je tourne en rond”, “je stagne”, “ça sert à rien”)
-- auto-pression / sur-contrôle (“il faut que…”, “je dois…”, “j’ai pas le droit de…”)
-- rumination / confusion (“je sais pas”, “je suis bloqué”, “je suis perdu”, “je pars dans tous les sens”)
-- tension émotionnelle (“je suis énervé”, “ça m’angoisse”, “j’ai la boule au ventre”)
-- doute identitaire (“je suis pas fait pour ça”, “je suis nul”, “j’y arriverai pas”)
-
-⚠️ Règle clé :
-Si l’utilisateur exprime un état interne (fatigue, doute, perte de sens, stress) même sans demander “motivation”,
-→ préférer motivational_guidance à decision_support.
-
-⸻
-
-action_request
-
-→ Demande d’exécution d’une action concrète.
-→ Signaux : “Réserve…”, “Rappelle-moi…”, “Envoie un email…”, “Planifie…”
-→ level=medium
-
-⸻
-
-deep_work
-
-→ Travail structuré et approfondi impliquant production, analyse longue ou livrable formel.
-→ level=medium (ou max si lié aux projets/contraintes de l’utilisateur)
-
-Déclencheurs typiques :
-- analyse / synthèse d’un document (PDF, Word, Excel…)
-- travail sur mémoire, thèse, dossier, business plan
-- rédaction longue structurée (plan détaillé, stratégie complète)
-- préparation d’examen ou coaching académique
-- dev / code / debug / architecture technique
-- projet nécessitant plusieurs étapes ou allers-retours
-
-Règle clé :
-Si la demande implique un livrable structuré, plusieurs itérations,
-ou dépasse une réponse exploitable en quelques paragraphes,
-→ choisir deep_work.
-
-Ne PAS choisir deep_work si :
-- simple question d’information (→ general_question)
-- arbitrage entre options (→ decision_support)
-- soutien émotionnel (→ motivational_guidance)
-
-⸻
-
-professional_request
-
-→ Demande liée à un métier / cadre pro spécifique (dossier client/patient, cabinet, Airbnb ops).
-→ Signaux : “Mon patient…”, “Dossier client…”, “Réservation Airbnb…”
-→ level=max
-
-⸻
-
-sensitive_question
-
-→ Santé, finance perso, juridique, info sensible.
-→ Signaux : symptômes, impôts, juridique, situation médicale, etc.
-→ level=max 
-
-⸻
-
-urgent_request
-
-→ Situation critique impliquant un danger immédiat ou une détresse grave.
-→ level=max
-
-🚨 Déclencheurs explicites :
-- Idées suicidaires ou auto-agressives (“je veux en finir”, “je ne veux plus vivre”, “je pense à me faire du mal”)
-- Danger immédiat (“je vais faire une bêtise”, “je suis en danger”, “on me menace”)
-- Symptômes médicaux graves en cours (perte de conscience, douleur thoracique intense, difficulté respiratoire aiguë)
-- Panique incontrôlable avec perte de contrôle
-
-⚠️ Important :
-Le mot “urgent” seul ne suffit PAS.
-Le stress, la pression professionnelle, l’anxiété légère, un délai court,
-ne déclenchent PAS urgent_request.
-
-Si l’urgence est psychologique légère ou liée à un choix,
-→ utiliser motivational_guidance ou decision_support.
-
-⸻
-
-PRIORITÉ SI AMBIGUÏTÉ
-
-sensitive_question > urgent_request > professional_request > decision_support >
-action_request > functional_question > motivational_guidance > general_question >
-small_talk > amabilities
-
-DÉSAMBIGUÏSATION DECISION_SUPPORT vs MOTIVATIONAL_GUIDANCE
-
-- decision_support = l’utilisateur veut choisir entre options (A/B), décider, trancher, comparer, arbitrer.
-  Indices : “quelle option”, “je choisis quoi”, “dois-je”, “j’hésite entre”, “lequel est mieux”, “avantages/inconvénients”.
-
-- motivational_guidance = l’utilisateur est en baisse d’énergie / sens / confiance, ou décrit une tension interne
-  même s’il mentionne une décision.
-  Indices : fatigue, découragement, anxiété, perte de sens, auto-pression, confusion, rumination.
-
-Règle de tie-break :
-Si un message contient à la fois (1) une décision et (2) un signal interne de fatigue/doute/stress,
-→ choisir motivational_guidance (stabiliser d’abord), sauf si l’utilisateur demande explicitement “choisis pour moi entre A et B”.
-
-DÉSAMBIGUÏSATION URGENT_REQUEST
-
-- urgent_request = danger vital, crise psychologique grave, santé préoccupante immédiate.
-- sensitive_question = question santé/finance/juridique sans danger immédiat.
-- motivational_guidance = détresse émotionnelle non critique.
-- decision_support = pression décisionnelle, même “urgente”.
-
-Règle :
-Si aucun danger immédiat ou risque vital n’est détecté,
-→ ne PAS choisir urgent_request.
+RÈGLE CONTEXT LEVEL
+- billing = à utiliser si la demande porte sur l’essai gratuit, le plan, la formule, la facturation, le paiement, Stripe, une facture, un portail client, un impayé, une continuité de service après essai, ou toute décision liée au statut payant du compte.
+- Tu choisis billing uniquement si l’information de facturation peut changer la réponse.
 
 ═══════════════════════════════════════════════════════════════
-WEB SEARCH (need_web)
+INTENTS — GRILLE DE SÉLECTION
 
-need_web=true si au moins 1 condition :
-A) Volatilité (actu, prix, offres, compatibilités, "meilleur X", comparatifs)
-B) Exactitude critique (juridique/admin/fiscal/santé/finance) → quasi systématique
-C) Besoin sources/liens vérifiables
-D) Automation/outils/intégrations/APIs (priorité)
+1. amabilities
+Usage :
+- merci
+- bonjour / bonsoir
+- au revoir
+- ok purement social / poli
 
-need_web=false si :
-- Question conceptuelle/coaching/organisation sans dépendance faits externes
-- Contexte fourni suffit et stable
+À choisir seulement si le message est réellement une politesse courte
+et ne cherche pas à poursuivre un sujet de fond.
 
-web_search_prompt (strict si need_web=true) :
-- 3-4 lignes max
-- Inclure pays + contexte + mots-clés + contrainte
-- Privilégier sources fiables
-- Si need_web=true => web_search_prompt DOIT être non vide.
-Sinon web_search_prompt=null.
+Level :
+- light
 
-Cas particulier : sensitve_question
-Quand intent = sensitive_question, tu DOIS te poser explicitement la question :
-“Est-ce que ma réponse dépend d’une règle officielle, d’un taux, d’une procédure, d’une obligation légale/fiscale, d’une démarche administrative, ou d’un fait susceptible d’avoir changé récemment ?”
+Docs :
+- jamais
 
-Si OUI → need_web = true, et web_search_prompt doit cibler des sources d’autorité.
+⸻
 
-Si NON → need_web = false (ex: organisation, méthode, hygiène financière générale, checklist non réglementaire).
+2. out_of_scope
 
-🧱 Qualité attendue (obligatoire)
-- Si need_web=true : web_search_prompt 3–4 lignes max, inclut pays + contexte + termes officiels.
-- Sources prioritaires : gouvernement/administrations/organismes publics/textes officiels/ordres pro.
-- Si tu ne trouves pas de sources fiables : tu n’inventes pas. Tu le dis et recommandes une voie sûre.
+Usage :
+- demande sans lien avec le travail, l’environnement ou les enjeux d’un cabinet médical
+- sujet sans utilité professionnelle pour un soignant ou un cabinet
+- conversation purement généraliste, personnelle ou de divertissement
 
-═══════════════════════════════════════════════════════════════ ...
+Inclut notamment :
+- loisirs, sport, actu people, divertissement
+- recommandations perso (restaurants, films, voyages…)
+- opinions générales sans lien métier
+- demandes pratiques du quotidien sans lien avec le cabinet
 
-{render_nodes_whitelist_block()}
-{render_ids_rules_block()}
+Exemples :
+- “Tu as vu le match du PSG ?”
+- “Tu penses quoi de tel film ?”
+- “Quel est le meilleur restaurant japonais à Paris ?”
+- “Raconte-moi une blague”
+- “Qui va gagner la Ligue des champions ?”
+- “Comment réparer mon lave-vaisselle ?”
+
+NON out_of_scope (doit être classé ailleurs) :
+- toute question liée à la santé, aux maladies, à l’épidémiologie ou aux systèmes de soins
+- toute question utile à la culture médicale ou à la pratique professionnelle
+- toute question liée au fonctionnement concret d’un cabinet (même non médical direct)
+- toute demande organisationnelle ou logistique dans un contexte cabinet
+
+Exemples :
+- “Combien de personnes meurent du palu chaque année ?” → medical_assistance
+- “Y a-t-il des hôpitaux fiables au Congo ?” → medical_assistance
+- “Si j’ai un souci avec le frigo du cabinet tu peux m’aider ?” → cabinet_assistance
+
+RÈGLE DE FRONTIÈRE
+Ne classe PAS en out_of_scope simplement parce que le sujet n’est pas strictement médical.
+
+Une question reste DANS le cadre si elle est utile à au moins un de ces niveaux :
+1. pratique médicale ou santé (directe ou indirecte)
+2. organisation ou fonctionnement du cabinet
+3. environnement professionnel du soignant
+
+Si aucun de ces 3 niveaux n’est présent → out_of_scope.
+
+En cas de doute :
+- privilégie toujours medical_assistance ou cabinet_assistance
+- out_of_scope est un dernier recours, pas un réflexe
+
+Level :
+- light
+
+Docs :
+- jamais
+
+Web :
+- jamais
+
+Rôle :
+- ne pas répondre sur le fond
+- recadrer élégamment vers le cadre professionnel de Lisa
+- rester naturelle, concise, jamais sèche
+
+⸻
+
+3. medical_assistance
+Usage :
+- question médicale générale
+- symptômes de manière générale
+- analyse non centrée sur un patient précis
+- explication de mécanismes, études, recommandations, diagnostics différentiels
+- aide médicale générale non rattachée à un dossier patient concret
+
+Exemples :
+- “Que peut évoquer une douleur thoracique atypique ?”
+- “Tu peux me résumer les recommandations sur…”
+- “Quels diagnostics différentiels garder en tête ?”
+
+Level :
+- max
+
+Docs :
+- optionnelles
+- seulement si une documentation interne améliore réellement la précision
+- sinon web si l’information doit être à jour ou sourcée
+
+⸻
+
+4. patient_case_assistance
+Usage :
+- la demande porte sur un patient précis, un cas clinique, un dossier médical, un raisonnement appliqué
+- présence d’un cas concret, d’un contexte clinique, d’un suivi, d’un arbitrage lié à un patient
+- le user attend une aide d’analyse, de structuration, de lecture clinique ou de hiérarchisation des hypothèses
+
+Exemples :
+- “J’ai un patient qui…”
+- “Que penses-tu de ce tableau clinique ?”
+- “Aide-moi à structurer ce cas”
+- “Quels diagnostics différentiels tu garderais ici ?”
+- “Comment lire ce tableau dans ce contexte ?”
+
+Frontière critique :
+- si la demande consiste à analyser, structurer, discuter ou éclairer un cas patient
+  → patient_case_assistance
+- si la demande consiste à vérifier, retrouver, envoyer, programmer, chercher dans le système,
+  manipuler un dossier, un mail, un agenda ou une donnée réelle du cabinet
+  → ce n’est PAS patient_case_assistance, c’est task_execution
+
+Exemples qui NE sont PAS patient_case_assistance :
+- “Trouve-moi le dossier du patient X”
+- “A-t-on reçu un mail du patient X ?”
+- “Programme un rendez-vous pour ce patient”
+- “Envoie-lui un message”
+- “Vérifie ses résultats dans le dossier”
+
+Level :
+- max
+
+Docs :
+- optionnelles
+- seulement si une doc interne pertinente existe réellement
+
+Web :
+- très fréquent
+- need_web = true si le cas ou la réponse dépend :
+  - de recommandations récentes,
+  - de protocoles,
+  - de guidelines,
+  - d’études,
+  - de données de sécurité,
+  - de conduite à tenir contemporaine,
+  - de références médicales à jour,
+  - ou si la fiabilité/sourcing médical change réellement la qualité de la réponse
+- need_web = false seulement si le médecin demande une lecture clinique stable,
+  générale, non dépendante d’une actualité scientifique ou réglementaire
+
+⸻
+
+5. cabinet_assistance
+Usage :
+- organisation du cabinet
+- secrétariat médical
+- gestion administrative
+- coordination
+- gestion des mails du cabinet
+- suivi post-consultation
+- bonnes pratiques métier cabinet
+- explication générale sur comment Lisa peut aider le cabinet
+
+Exemples :
+- “Comment peux-tu m’aider sur les mails ?”
+- “Comment fluidifier le secrétariat ?”
+- “Quels sujets peux-tu prendre en charge au cabinet ?”
+- “Comment organiser le suivi post-consultation ?”
+
+Exemples qui doivent déclencher des docs si un scope pertinent existe :
+- “Le suivi patients, ça consiste en quoi exactement ?”
+- “Montre-moi plus concrètement comment tu aides sur les mails”
+- “Quand tu dis coordination, tu prends quoi en charge ?”
+- “Explique-moi en détail ce que tu peux faire sur le secrétariat”
+
+Level :
+- medium
+
+Docs :
+- optionnelles dans les questions métier générales de cabinet
+- obligatoires si le user demande de détailler, préciser ou approfondir :
+  - une capacité de Lisa,
+  - un service annoncé par Lisa,
+  - un exemple concret de ce que Lisa peut prendre en charge,
+  - un process cabinet que Lisa dit pouvoir améliorer ou gérer
+- si un scope pertinent existe dans la documentation disponible, il faut le demander
+
+⸻
+
+6. product_support
+Usage :
+- setup
+- bug
+- permissions
+- connecteurs
+- configuration
+- fonctionnement produit
+- boîte mail, agenda, intégrations, activation, paramétrage
+
+Exemples :
+- “Comment connecter la boîte mail ?”
+- “Pourquoi tel connecteur ne marche pas ?”
+- “Comment paramétrer l’espace cabinet ?”
+
+Level :
+- medium
+
+Docs :
+- obligatoires si des scopes pertinents existent
+- si des docs existent, il faut les demander
+
+⸻
+
+7. task_execution
+Usage :
+- le user demande à Lisa de faire, préparer, structurer, vérifier ou lancer une action concrète
+- création / préparation / organisation d’une tâche
+- demande opérationnelle orientée exécution
+- vérification d’un élément réel du cabinet ou du système
+- récupération, recherche, manipulation ou préparation d’un contenu concret
+
+Exemples :
+- “Prépare-moi un modèle de réponse”
+- “Aide-moi à organiser le suivi”
+- “Prépare la structure d’un process”
+- “Trouve-moi le dossier du patient X”
+- “A-t-on reçu un mail de Y ?”
+- “Prépare un message pour ce patient”
+- “Regarde si on a déjà un rendez-vous prévu”
+- “Liste les éléments à envoyer après consultation”
+
+Frontière critique :
+- si la demande porte sur une action réelle, une vérification, une recherche d’information opérationnelle,
+  un dossier, un mail, un agenda, un document ou une préparation concrète
+  → task_execution
+- même si un patient est mentionné, si l’enjeu principal est opérationnel et non analytique,
+  l’intent reste task_execution
+
+Exemples :
+- “A-t-on reçu un mail du patient X ?” → task_execution
+- “Trouve son dossier” → task_execution
+- “Prépare une réponse au patient” → task_execution
+- “Programme le suivi” → task_execution
+
+Level :
+- medium à max selon complexité
+
+Docs :
+- obligatoires si la demande dépend du produit, du setup, d’un connecteur ou d’une capacité spécifique Lisa
+- sinon optionnelles
+
+Web :
+- rarement prioritaire
+- seulement si l’action demandée dépend d’une information externe récente ou vérifiable
+
+⸻
+
+8. emotional_support
+Usage :
+- fatigue
+- surcharge
+- tension
+- découragement
+- ras-le-bol
+- pression émotionnelle dans le cadre du travail du cabinet
+
+Exemples :
+- “J’en peux plus”
+- “Je suis débordé”
+- “Je sature avec le cabinet”
+
+Level :
+- max
+
+Docs :
+- jamais
+
+Rôle :
+- soutenir avec tact
+- aider à clarifier
+- rester professionnelle
+- ne pas basculer en psychologue ni en discussion hors cadre
 
 ═══════════════════════════════════════════════════════════════
-RÈGLE CLÉ — DYNAMIQUE DE CONVERSATION (OBLIGATOIRE)
+PRIORITÉ DES INTENTS (STRICT)
 
-Tu ne classes JAMAIS l'intent uniquement sur le dernier message.
-Tu dois d'abord analyser la dynamique des 10 derniers messages (ctx.history.messages) :
+Tu dois toujours sélectionner UN SEUL intent principal.
 
-- Si une tâche est en cours (deep_work / decision_support / professional_request / action_request),
-  alors un message court ("ok", "vas-y", "continue", "parfait", "merci") signifie très souvent :
-  -> continuer le même intent (continuité de thread), pas "amabilities".
+Ordre de priorité (du plus fort au plus faible) :
 
-- Si le dernier intent assistant est disponible (metadata intent_final/mode), tu l'utilises comme signal fort
-  pour interpréter le message utilisateur, sauf si le contexte global ne rend plus la conversation éligible à un intent donné (smalltalk_intro).
+1. product_support
+2. task_execution
+3. patient_case_assistance
+4. medical_assistance
+5. emotional_support
+6. cabinet_assistance
+7. out_of_scope
+8. amabilities
 
-Le dernier message utilisateur sert surtout à ajuster :
-- la priorité,
-- need_web,
-- les scopes docs,
-- et le niveau de contexte.
+---
 
-TON JOB
-Analyser message user dans son contexte (tenir compte des échanges précédents) → Produire plan DAG optimal pour répondre au dernier message user.
+RÈGLES D’ARBITRAGE
 
-LANGUE
-- language = fr, en, es, de, it, pt, other
-- Si incertain: language="fr"
+1) PRODUCT_SUPPORT PRIORITAIRE
+
+Si le message porte sur :
+- setup
+- bug
+- configuration
+- connecteurs
+- permissions
+- fonctionnement produit
+
+→ intent = product_support
+
+Même si :
+- une action est demandée
+- un contexte cabinet est mentionné
+
+Ex :
+“Comment connecter la boîte mail ?” → product_support
+
+---
+
+2) TASK_EXECUTION PRIORITAIRE SUR TOUT LE RESTE (SAUF PRODUCT_SUPPORT)
+
+Si le message contient une intention d’action concrète :
+- préparer
+- créer
+- organiser
+- vérifier
+- trouver
+- envoyer
+- programmer
+- générer
+- structurer un livrable
+
+→ intent = task_execution
+
+Même si :
+- un patient est mentionné
+- le sujet est médical
+- le contexte est cabinet
+
+Exemples :
+- “A-t-on reçu un mail du patient X ?” → task_execution
+- “Prépare une réponse à ce patient” → task_execution
+- “Organise le suivi post-consultation” → task_execution
+
+RÈGLE :
+👉 verbe d’action concret = task_execution
+
+---
+
+3) PATIENT_CASE_ASSISTANCE AVANT MEDICAL_ASSISTANCE
+
+Si :
+- un patient précis est mentionné
+- un cas clinique est décrit
+- un raisonnement appliqué à un cas est demandé
+
+→ intent = patient_case_assistance
+
+Exemples :
+- “J’ai un patient avec…” → patient_case_assistance
+- “Que penses-tu de ce tableau clinique ?” → patient_case_assistance
+
+Même si :
+- la question est médicale complexe
+
+RÈGLE :
+👉 cas réel = patient_case_assistance
+
+---
+
+4) MEDICAL_ASSISTANCE (GÉNÉRAL)
+
+Si :
+- la question est médicale
+- mais SANS cas patient précis
+
+→ intent = medical_assistance
+
+Exemples :
+- “Quels sont les diagnostics différentiels de…” → medical_assistance
+- “Que disent les recommandations sur…” → medical_assistance
+
+---
+
+5) EMOTIONAL_SUPPORT
+
+Si :
+- le message exprime fatigue, tension, doute, surcharge
+- sans demande d’action ni question technique
+
+→ intent = emotional_support
+
+Si une action est demandée → task_execution prend le dessus
+
+---
+
+6) CABINET_ASSISTANCE
+
+Si :
+- organisation du cabinet
+- secrétariat
+- coordination
+- bonnes pratiques métier
+- compréhension des capacités Lisa côté cabinet
+
+→ intent = cabinet_assistance
+
+Mais :
+- si demande d’action → task_execution
+- si setup produit → product_support
+
+---
+
+7) OUT_OF_SCOPE
+
+Si :
+- le message est hors travail,
+- hors cabinet,
+- hors médical,
+- hors produit HeyLisa,
+- et n’apporte aucune utilité professionnelle claire,
+
+→ intent = out_of_scope
+
+Exemples :
+- “Tu as vu le score du PSG ?”
+- “Tu penses quoi de cette série ?”
+- “On parle de foot ?”
+
+RÈGLE :
+👉 sujet hors cadre utile = out_of_scope
+
+---
+
+8) AMABILITIES (DERNIER NIVEAU)
+
+Si :
+- simple politesse
+- sans autre intention
+
+→ intent = amabilities
+
+Exemples :
+- “Merci”
+- “Bonjour”
+- “Bonne nuit”
+
+---
+
+RÈGLES CRITIQUES TRANSVERSES
+
+- Tu ne sélectionnes JAMAIS plusieurs intents
+- Tu privilégies toujours l’intention la plus opérationnelle
+- En cas de doute entre analyse et action → action gagne (task_execution)
+- En cas de doute entre cas patient et médical général → cas patient gagne
+- En cas de doute entre produit et reste → produit gagne
+
+---
+
+RÈGLE D’OR
+
+Tu choisis l’intent qui correspond à
+👉 ce que l’utilisateur attend concrètement comme sortie,
+pas seulement au sujet évoqué.
+
+═══════════════════════════════════════════════════════════════
+RÈGLE CLÉ — DYNAMIQUE DE CONVERSATION
+
+Tu ne classes jamais l’intent uniquement sur le dernier message.
+
+Tu dois tenir compte des derniers messages de ctx.history.messages.
+
+Si le user approfondit un point de la réponse précédente de Lisa,
+tu conserves l’intent de fond au lieu de reclasser trop vite.
+
+Un message comme :
+- “ok”
+- “vas-y”
+- “continue”
+- “très utile mais besoin de plus de détails”
+- “montre-moi plus concrètement”
+sert souvent à poursuivre le sujet déjà en cours.
 
 ═══════════════════════════════════════════════════════════════
 DOCS SCOPES POLICY (STRICT)
 
 Tu peux demander des docs via :
 - scope_need = true
-- scopes_selected = [ ... ] (1 à 5 scopes)
+- scopes_selected = [ ... ] (1 à 5 scopes maximum)
 
 Règles :
-1) Tu n’inventes JAMAIS de scopes. Tu choisis uniquement les plus pertinents pour le contexte dans "DOCUMENTATION DISPONIBLE (SCOPES EXACTS)".
-2) functional_question => scope_need = true OBLIGATOIRE et scopes_selected non vide (1..5), sauf si aucun scope pertinent n’existe.
-3) discovery => scope_need = true (déjà géré côté code) mais tu peux aussi proposer d’autres scopes pertinents.
-4) small_talk / amabilities => scope_need = false, scopes_selected = [].
+1. Tu n’inventes jamais de scope.
+2. Tu choisis uniquement dans la liste “DOCUMENTATION DISPONIBLE (SCOPES EXACTS)”.
+3. product_support :
+   - si un scope pertinent existe, scope_need = true obligatoire.
+4. cabinet_assistance :
+   - scope_need = true si les docs permettent une réponse plus précise sur les capacités réelles de Lisa
+     ou sur un process cabinet / produit documenté.
+5. medical_assistance :
+   - scope_need = true seulement si une doc interne pertinente existe réellement.
+   - sinon need_web=true si l’info doit être récente, réglementaire ou sourcée.
+6. patient_case_assistance :
+   - scope_need = true seulement si un scope pertinent existe réellement.
+7. task_execution :
+   - scope_need = true si la demande dépend du produit, du setup, d’un connecteur ou d’une capacité documentée.
+8. emotional_support et amabilities :
+   - scope_need = false
+   - scopes_selected = []
+9. discovery_capabilities :
+   - scope_need = true obligatoire
+   - inclure en priorité discovery.medical_assistant
+10. Si aucun scope pertinent n’existe dans la liste disponible :
+   - scope_need = false
+   - scopes_selected = []
 
 ═══════════════════════════════════════════════════════════════
+WEB SEARCH (need_web)
 
-🔒 PLAYBOOK DECISION MATRIX
+need_web=true si au moins une condition est vraie :
+A) l’information est volatile, récente ou susceptible d’avoir changé
+B) la réponse exige une exactitude critique
+C) la demande appelle des sources ou références vérifiables
+D) la question médicale porte sur recommandations, études, protocoles, règles, procédures ou faits contemporains
+E) la question implique un arbitrage médical qui bénéficie d’un état de l’art récent
+F) la demande touche à posologie, sécurité, contre-indications, surveillance, guideline, conduite à tenir ou synthèse de littérature
 
-Tu dois déterminer playbook_need et playbook_level selon les règles suivantes :
-	1.	Si ctx.onboarding.status == “started”
-→ playbook_need = true
-→ playbook_level = “full”
-	2.	Sinon si ctx.onboarding.pro_mode == true ET intent in [“professional_request”, “action_request”]
-→ playbook_need = true
-→ playbook_level = “light”
-	3.	Sinon si ctx.onboarding.pro_mode == false ET intent == “action_request”
-→ playbook_need = true
-→ playbook_level = “light”
-	4.	Si ctx.gates.smalltalk_intro_eligible == true
-→ playbook_need = false
-	5.	Sinon
-→ playbook_need = false
+need_web=false seulement si :
+- la réponse peut être donnée à partir de connaissances stables et très bien établies
+- le contexte fourni suffit réellement
+- la demande porte sur une clarification simple, non dépendante de faits externes
+- il ne s’agit ni d’une recommandation récente, ni d’une question réglementaire, ni d’une synthèse d’études, ni d’un sujet où la fraîcheur de l’information change la qualité de la réponse
 
-Tu ne choisis jamais la clé du playbook.
-La clé vient de ctx.onboarding.primary_agent_key.
+RÈGLE MÉDICALE SPÉCIFIQUE
+
+Pour les questions médicales :
+- tu privilégies presque toujours need_web=true
+- sauf si la question est manifestement simple, stable, courte et bien établie
+- en cas de doute, tu actives need_web=true
+
+QUALITÉ ATTENDUE DU web_search_prompt
+
+Si need_web=true, web_search_prompt doit :
+- faire 3 à 6 lignes maximum
+- être orienté recherche de haute qualité, pas grand public
+- inclure le contexte clinique ou métier utile
+- inclure les mots-clés médicaux centraux
+- inclure une contrainte explicite de fiabilité
+- préciser si l’objectif est :
+  - recommandations officielles,
+  - synthèse d’études,
+  - conduite pratique,
+  - sécurité / posologie / contre-indications,
+  - état des controverses,
+  - sources récentes
+
+SOURCES À PRIVILÉGIER
+
+Le web_search_prompt doit orienter vers :
+- recommandations officielles
+- sociétés savantes reconnues
+- autorités de santé nationales et internationales
+- revues médicales sérieuses
+- méta-analyses, revues systématiques, essais cliniques, consensus
+- institutions académiques / hospitalo-universitaires reconnues
+
+SOURCES À ÉVITER
+
+Le web_search_prompt doit implicitement ou explicitement éviter :
+- blogs
+- sites marketing
+- articles grand public faibles
+- contenus sensationnalistes
+- sources non médicales
+- pages peu traçables
+
+PORTÉE GÉOGRAPHIQUE
+
+Tu ne limites pas la recherche à la France sauf si le sujet l’exige.
+Pour les sujets médicaux, tu privilégies une recherche internationale quand pertinent.
+Tu précises un pays seulement si la demande dépend d’un cadre local :
+- réglementation
+- remboursement
+- autorisation
+- protocole national
+- organisation administrative locale
+
+FORMAT DU web_search_prompt
+
+Le web_search_prompt doit être concret et exploitable.
+Il ne doit pas être vague.
+
+Exigences :
+- inclure le sujet exact
+- inclure le type d’information recherchée
+- inclure le niveau de preuve attendu si pertinent
+- inclure la contrainte “sources fiables / officielles / médicales reconnues”
+- si utile, inclure “international guidelines”, “systematic review”, “meta-analysis”, “consensus”, “safety”, “dose”, “contraindications”, “clinical recommendations”
+
+EXEMPLES DE BONNE INTENTION DE RECHERCHE
+
+- rechercher recommandations récentes + sociétés savantes + revue de littérature
+- rechercher sécurité / posologie / contre-indications avec sources médicales fiables
+- rechercher état des recommandations internationales et points de divergence
+- rechercher synthèse de données robustes plutôt qu’articles généralistes
+
+Si need_web=true :
+- web_search_prompt doit être non vide
+- il doit être assez précis pour guider une vraie recherche fiable
+- il doit refléter le bon niveau d’exigence du sujet
 
 ═══════════════════════════════════════════════════════════════
-ONBOARDING_PATCH (ÉCRITURE DB)
+RÈGLES SUPPLÉMENTAIRES
 
-Tu peux proposer un onboarding_patch UNIQUEMENT si ctx.runtime_state.state == "onboarding".
+Ton rôle est seulement de choisir :
+  - intent
+  - context_level
+  - need_web
+  - web_search_prompt
+  - scope_need
+  - scopes_selected
 
-Règles strictes :
-- onboarding_patch.should_write = true seulement si le message user apporte une info exploitable.
-- target doit être une string courte (ex: "personal", "business", "airbnb", "medical") ou null.
-- level_max doit être "light" | "medium" | "max" ou null.
-- metadata_patch = petit objet (max 10 clés). Pas de texte long. Pas de PII.
-- Si tu n'es pas sûr => should_write=false (et tout le reste null/{{}}).
-
-SORTIE: voir schéma.
+═══════════════════════════════════════════════════════════════
+{render_nodes_whitelist_block()}
+{render_ids_rules_block()}
 """
 
 
 JSON_SCHEMA_HINT = {
-  "ok": True,
-  "language": "fr",
-  "intent": "general_question",
-  "context_level": "medium",
-  "need_web": False,
-  "web_search_prompt": None,
-  "confidence": 0.92,
-
-  "scope_need": False,
-  "scopes_selected": [],
-
-  "playbook_need": False,
-  "playbook_level": None,
-
-  "onboarding_patch": {
-    "should_write": False,
-    "target": None,
-    "level_max": None,
-    "metadata_patch": {}
-  },
-
-  "plan":  {
-        "nodes": [
-            {
-                "id": "A",
-                "type": "tool.db_load_context",
-                "parallel_group": "P1",
-                "inputs": {"level": "medium"},
-            },
-            {"id": "B", "type": "tool.quota_check", "parallel_group": "P1"},
-            {
-                "id": "D",
-                "type": "agent.response_writer",
-                "depends_on": ["A", "B"],
-                "inputs": {
-                    "intent": "general_question",
-                    "language": "fr",
-                    "tone": "warm",
-                    "need_web": False,
-                },
-            },
-        ]
-    },
-    "debug": {"notes": "short", "signals": []},
+    "ok": True,
+    "language": "fr",
+    "intent": "cabinet_assistance",
+    "context_level": "medium",
+    "need_web": False,
+    "web_search_prompt": None,
+    "confidence": 0.92,
+    "scope_need": False,
+    "scopes_selected": [],
+    "debug": {
+        "notes": "short",
+        "signals": []
+    }
 }
 
 
@@ -462,11 +800,18 @@ def _state_from_ctx(ctx: Optional[Dict[str, Any]]) -> str:
     except Exception:
         return ""
 
+def _trial_feedback_active_from_ctx(ctx: Optional[Dict[str, Any]]) -> bool:
+    try:
+        flags = (ctx or {}).get("conversation_flags") or {}
+        return bool(flags.get("trial_feedback_active") is True)
+    except Exception:
+        return False
+
 def _normalize_state(s: str) -> StateType:
     s = (s or "").strip()
-    if s in {"smalltalk_intro", "discovery", "discovery_pending", "onboarding", "ongoing_personal", "ongoing_pro"}:
+    if s in {"smalltalk_onboarding", "discovery_capabilities", "normal_run"}:
         return s  # type: ignore
-    return "ongoing_personal"
+    return "normal_run"
 
 def _render_docs_scopes_block(ctx: Optional[Dict[str, Any]]) -> str:
     """
@@ -509,7 +854,6 @@ def _render_docs_scopes_block(ctx: Optional[Dict[str, Any]]) -> str:
 def _fallback_plan_minimal(language: str = "fr") -> Dict[str, Any]:
     """
     Filet de sécurité uniquement.
-    Plan standard (toujours le même), pour éviter de crasher si le LLM sort un truc invalide.
     """
     return {
         "nodes": [
@@ -525,7 +869,7 @@ def _fallback_plan_minimal(language: str = "fr") -> Dict[str, Any]:
                 "type": "agent.response_writer",
                 "depends_on": ["A", "B"],
                 "inputs": {
-                    "intent": "general_question",
+                    "intent": "cabinet_assistance",
                     "language": language,
                     "tone": "warm",
                     "need_web": False,
@@ -604,67 +948,48 @@ def _apply_business_gates(
     ctx: Dict[str, Any],
     confidence: float,
 ) -> Dict[str, Any]:
-    """
-    Orchestrator ne choisit PLUS de state.
-    Il choisit uniquement intent + applique:
-    - guardrails smalltalk_intro (ne pas "déraper" trop vite)
-    - capabilities gating (action/deep_work/pro_request)
-    """
     gate = _compute_smalltalk_intro_gate(ctx)
     caps = _compute_capabilities(ctx)
 
     eligible_intro = bool(gate["smalltalk_intro_eligible"])
     short_ack = _is_short_ack(user_message)
 
-    intent = (llm_intent or "general_question").strip()
+    intent = (llm_intent or "cabinet_assistance").strip()
 
-    # intents autorisés (safety net)
     allowed = {
-        "small_talk",
         "amabilities",
-        "functional_question",
-        "general_question",
-        "decision_support",
-        "motivational_guidance",
-        "action_request",
-        "deep_work",
-        "professional_request",
-        "sensitive_question",
-        "urgent_request",
+        "medical_assistance",
+        "patient_case_assistance",
+        "cabinet_assistance",
+        "product_support",
+        "task_execution",
+        "emotional_support",
+        "out_of_scope",
     }
     if intent not in allowed:
-        intent = "general_question"
+        intent = "cabinet_assistance"
 
-    # Guardrail smalltalk_intro:
-    # si intro éligible, on laisse passer uniquement:
-    # - urgent/sensitive
-    # - ou un intent "fort" si confiance haute ET message pas juste un ack
-    hard_overrides = {"urgent_request", "sensitive_question"}
     strong_intents = {
-        "functional_question",
-        "general_question",
-        "decision_support",
-        "motivational_guidance",
-        "professional_request",
-        "action_request",
-        "deep_work",
+        "medical_assistance",
+        "patient_case_assistance",
+        "cabinet_assistance",
+        "product_support",
+        "task_execution",
+        "emotional_support",
     }
 
     if eligible_intro:
-        if intent in hard_overrides:
-            intent_final = intent
-        elif intent in strong_intents and confidence >= 0.85 and not short_ack:
+        if intent in strong_intents and confidence >= 0.85 and not short_ack:
             intent_final = intent
         else:
-            # pendant l’intro, on absorbe vers small_talk (pas "smalltalk_intro"!)
-            intent_final = "small_talk"
+            intent_final = "amabilities"
     else:
         intent_final = intent
 
-    # Capabilities gating
     intent_eligible = True
     block_reason = None
-    if intent_final in {"action_request", "deep_work", "professional_request"}:
+
+    if intent_final == "task_execution":
         if not caps.get("has_paid_agent"):
             intent_eligible = False
             block_reason = "AGENT_NOT_ACTIVE"
@@ -693,60 +1018,58 @@ def _build_plan_minimal(
     intent_block_reason: Optional[str],
     transition_window: bool,
     transition_reason: Optional[str],
-
     scope_need: bool,
     scopes_selected: List[str],
-
-    playbook_need: bool,
-    playbook_level: Optional[str],
-    primary_agent_key: Optional[str],
-
-    # --- onboarding write (optionnel) ---
-    should_insert_onboarding_node: bool,
-    onboarding_target: Optional[str],
-    onboarding_level_max: Optional[str],
-    onboarding_metadata_patch: Dict[str, Any],
+    trial_feedback_prompt_enabled: bool,
 ) -> Dict[str, Any]:
     """
     Plan stable, peu risqué.
     """
+    context_loader_level = context_level or "medium"
+
     nodes = [
         {
             "id": "A",
             "type": "tool.db_load_context",
             "parallel_group": "P1",
-            "inputs": {"level": context_level or "medium"},
+            "inputs": {"level": context_loader_level},
         },
     ]
 
-    if playbook_need and primary_agent_key:
+    # amabilities en mode normal => pas de quota_check
+    if not (mode == "normal" and intent == "amabilities"):
         nodes.append(
             {
-                "id": "P",
-                "type": "tool.playbook_load",
-                "depends_on": ["A"],
+                "id": "B",
+                "type": "tool.quota_check",
+                "parallel_group": "P1",
+            }
+        )
+
+    is_medical_intent = intent in {
+        "medical_assistance",
+        "patient_case_assistance",
+    }
+
+    if need_web:
+        web_tool_type = (
+            "tool.web_search_medical"
+            if is_medical_intent
+            else "tool.web_search"
+        )
+
+        nodes.append(
+            {
+                "id": "C",
+                "type": web_tool_type,
+                "depends_on": ["A", "B"] if any(n["id"] == "B" for n in nodes) else ["A"],
                 "inputs": {
-                    "agent_key": primary_agent_key,
-                    "level": playbook_level or "light",
+                    "prompt": web_search_prompt,
+                    "language": language,
                 },
             }
         )
 
-    # amabilities en mode normal => pas de quota_check
-    if not (mode == "normal" and intent == "amabilities"):
-        nodes.append({"id": "B", "type": "tool.quota_check", "parallel_group": "P1"})
-
-    if need_web:
-        nodes.append(
-            {
-                "id": "C",
-                "type": "tool.web_search",
-                "depends_on": ["A"] if not any(n["id"] == "B" for n in nodes) else ["A", "B"],
-                "inputs": {"prompt": web_search_prompt, "language": language},
-            }
-        )
-
-    # --- Documentation chunks (scopes) ---
     if scope_need:
         nodes.append(
             {
@@ -754,23 +1077,7 @@ def _build_plan_minimal(
                 "type": "tool.docs_chunks",
                 "depends_on": ["A"],
                 "inputs": {
-                    "scopes": scopes_selected[:DOCS_SCOPES_MAX],  # hard cap sécurité
-                },
-            }
-        )
-
-    # --- Onboarding write ---
-    # Node O : écrit target/level_max/metadata puis sync status started/complete
-    if should_insert_onboarding_node:
-        nodes.append(
-            {
-                "id": "O",
-                "type": "tool.onboarding_set_fields",
-                "depends_on": ["A"],
-                "inputs": {
-                    "target": onboarding_target,
-                    "level_max": onboarding_level_max,
-                    "metadata_patch": onboarding_metadata_patch or {},
+                    "scopes": scopes_selected[:DOCS_SCOPES_MAX],
                 },
             }
         )
@@ -786,12 +1093,6 @@ def _build_plan_minimal(
     if scope_need:
         deps.append("S")
 
-    if should_insert_onboarding_node:
-        deps.append("O")
-
-    if playbook_need and primary_agent_key:
-        deps.append("P")
-
     nodes.append(
         {
             "id": "D",
@@ -806,9 +1107,9 @@ def _build_plan_minimal(
                 "smalltalk_target_key": (gates or {}).get("smalltalk_target_key"),
                 "intent_eligible": intent_eligible,
                 "intent_block_reason": intent_block_reason,
-
                 "transition_window": bool(transition_window),
                 "transition_reason": transition_reason,
+                "trial_feedback_prompt_enabled": bool(trial_feedback_prompt_enabled),
             },
         }
     )
@@ -870,12 +1171,15 @@ def _sanitize_plan_or_fallback(
     if not any(n.get("type") == "agent.response_writer" for n in nodes):
         return _fallback("plan_missing_response_writer")
 
-    # 4) need_web => node tool.web_search obligatoire + prompt non vide
+    # 4) need_web => node web search obligatoire + prompt non vide
     if need_web:
         if not isinstance(web_search_prompt, str) or not web_search_prompt.strip():
             return _fallback("need_web_but_prompt_missing")
 
-        if not any(n.get("type") == "tool.web_search" for n in nodes):
+        if not any(
+            n.get("type") in {"tool.web_search", "tool.web_search_medical"}
+            for n in nodes
+        ):
             return _fallback("need_web_but_web_node_missing")
 
     # 4bis) scope_need => node tool.docs_chunks obligatoire + scopes_selected non vide
@@ -932,6 +1236,22 @@ class OrchestratorAgent:
         docs_block = _render_docs_scopes_block(ctx)
         system_prompt = SYSTEM_PROMPT + docs_block
 
+        try:
+            docs_ctx = (ctx or {}).get("docs") or {}
+            docs_scopes_all = docs_ctx.get("scopes_all") or []
+            if not isinstance(docs_scopes_all, list):
+                docs_scopes_all = []
+
+            from app.core.chat_logger import chat_logger
+            chat_logger.info(
+                "chat.orchestrator.docs_scopes_input",
+                docs_scopes_count=len(docs_scopes_all),
+                docs_scopes_sample=docs_scopes_all[:10],
+                docs_block_len=len(docs_block or ""),
+            )
+        except Exception:
+            pass
+
         llm_messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -959,7 +1279,7 @@ class OrchestratorAgent:
         # hard fallback si JSON invalide
         if not data:
             language = "fr"
-            intent: IntentType = "general_question"
+            intent: IntentType = "cabinet_assistance"
             level: ContextLevel = "medium"
             plan = _fallback_plan_minimal("fr")
             return OrchestratorResult(
@@ -985,7 +1305,7 @@ class OrchestratorAgent:
                 ok=False,
                 language="fr",
                 state=_normalize_state(_state_from_ctx(ctx)),
-                intent="general_question",
+                intent="cabinet_assistance",
                 context_level="medium",
                 need_web=False,
                 web_search_prompt=None,
@@ -996,6 +1316,7 @@ class OrchestratorAgent:
         
         state = _normalize_state(_state_from_ctx(ctx))
         language = _language_from_ctx(ctx)
+        trial_feedback_prompt_enabled = _trial_feedback_active_from_ctx(ctx)
         primary_agent_key = None
         try:
             ob = (ctx or {}).get("onboarding") or {}
@@ -1005,7 +1326,7 @@ class OrchestratorAgent:
                     primary_agent_key = primary_agent_key.strip() or None
         except Exception:
             primary_agent_key = None
-        intent = data.get("intent") or "general_question"
+        intent = data.get("intent") or "cabinet_assistance"
         level = data.get("context_level") or "medium"
         confidence = float(data.get("confidence") or 0.0)
 
@@ -1042,46 +1363,8 @@ class OrchestratorAgent:
                     scopes_selected.append(s.strip())
 
     
-        # --- Onboarding patch (optionnel, proposé par le LLM) ---
-        onboarding_patch = data.get("onboarding_patch") or {}
-        if not isinstance(onboarding_patch, dict):
-            onboarding_patch = {}
 
-        op_should_write = bool(onboarding_patch.get("should_write") is True)
-
-        op_target = onboarding_patch.get("target")
-        op_level_max = onboarding_patch.get("level_max")
-        op_metadata_patch = onboarding_patch.get("metadata_patch") or {}
-        if not isinstance(op_metadata_patch, dict):
-            op_metadata_patch = {}
-
-        # nettoyage soft
-        if isinstance(op_target, str):
-            op_target = op_target.strip()
-        else:
-            op_target = None
-
-        if isinstance(op_level_max, str):
-            op_level_max = op_level_max.strip()
-        else:
-            op_level_max = None
-
-        # règle hard: on write seulement en state=onboarding + should_write + au moins 1 champ exploitable
-        should_insert_onboarding_node = (
-            state == "onboarding"
-            and op_should_write
-            and bool(op_target or op_level_max or op_metadata_patch)
-        )
-
-        # Règle 1: si scope_need=false => scopes_selected=[]
-        if not scope_need:
-            scopes_selected = []
-
-        # Règle 2: si scope_need=true MAIS aucun scope valide => on désactive
-        if scope_need and len(scopes_selected) == 0:
-            scope_need = False
-
-        # --- Business gates déterministes (mode smalltalk_intro + capabilities) ---
+        # --- Business gates déterministes ---
         gate_out = _apply_business_gates(
             llm_intent=str(intent),
             user_message=user_message,
@@ -1091,35 +1374,62 @@ class OrchestratorAgent:
 
         intent_final = gate_out["intent_final"]
 
-        # matrice déterministe
+        # =====================================================
+        # HARD RULES DOCS
+        # =====================================================
+        available_scopes = ((ctx or {}).get("docs") or {}).get("scopes_all") or []
+        if not isinstance(available_scopes, list):
+            available_scopes = []
+
+        # jamais de docs pour ces intents
+        if intent_final in {"emotional_support", "amabilities", "out_of_scope"}:
+            scope_need = False
+            scopes_selected = []
+
+        if intent_final == "out_of_scope":
+            level = "light"
+            need_web = False
+            web_search_prompt = None
+            scope_need = False
+            scopes_selected = []
+
+        # product_support => docs obligatoires si scopes dispo
+        elif intent_final == "product_support":
+            if len(available_scopes) > 0:
+                scope_need = True
+
+        # task_execution => docs si déjà pressenties et scopes dispo
+        elif intent_final == "task_execution":
+            if scope_need and len(available_scopes) > 0:
+                scope_need = True
+
+        # cabinet_assistance => pas de forçage dur
+        # medical_assistance => pas de forçage dur
+        # patient_case_assistance => pas de forçage dur
+
+        # si scope_need=false => scopes_selected=[]
+        if not scope_need:
+            scopes_selected = []
+
+        # si scope_need=true mais aucun scope valide => off
+        if scope_need and len(scopes_selected) == 0 and state != "discovery_capabilities":
+            scope_need = False
+
+        intent_final = gate_out["intent_final"]
+
         playbook_need = False
         playbook_level = None
-
-        if ob_status == "started":
-            playbook_need = True
-            playbook_level = "full"
-        elif (ob_pro_mode is True) and (intent_final in {"professional_request", "action_request"}):
-            playbook_need = True
-            playbook_level = "light"
-        elif (ob_pro_mode is False) and (intent_final == "action_request"):
-            playbook_need = True
-            playbook_level = "light"
-
-        # règle: si smalltalk intro, jamais de playbook
-        if smalltalk_intro_eligible:
-            playbook_need = False
-            playbook_level = None
             
         mode = state
         gates = gate_out["gates"]
 
-        # --- Guardrail scopes: jamais pendant smalltalk (intro/soft/amabilities) ---
-        if state == "smalltalk_intro" or intent_final in {"small_talk", "amabilities"}:
+        # --- Guardrail scopes: jamais pendant smalltalk_onboarding / amabilities ---
+        if state == "smalltalk_onboarding" or intent_final == "amabilities":
             scope_need = False
             scopes_selected = []
 
-        # --- Discovery: scope obligatoire "value_proposition" ---
-        if state == "discovery":
+        # --- Discovery capabilities: scope obligatoire ---
+        if state == "discovery_capabilities":
             scope_need = True
             scopes_selected = _ensure_mandatory_scope(
                 scopes_selected,
@@ -1154,18 +1464,9 @@ class OrchestratorAgent:
             intent_block_reason=intent_block_reason,
             transition_window=transition_window,
             transition_reason=transition_reason,
-
             scope_need=scope_need,
             scopes_selected=scopes_selected,
-
-            playbook_need=playbook_need,
-            playbook_level=playbook_level,
-            primary_agent_key=primary_agent_key,
-
-            should_insert_onboarding_node=bool(should_insert_onboarding_node),
-            onboarding_target=op_target,
-            onboarding_level_max=op_level_max,
-            onboarding_metadata_patch=op_metadata_patch,
+            trial_feedback_prompt_enabled=trial_feedback_prompt_enabled,
         )
 
         debug = data.get("debug") or {}
@@ -1182,13 +1483,8 @@ class OrchestratorAgent:
         debug["intent_block_reason"] = intent_block_reason
         debug["scope_need"] = scope_need
         debug["scopes_selected"] = scopes_selected
-        debug["onboarding_should_write"] = bool(should_insert_onboarding_node)
-        debug["onboarding_patch_preview"] = {
-            "target": op_target,
-            "level_max": op_level_max,
-            "metadata_patch_keys": list((op_metadata_patch or {}).keys())[:20],
-        }
         debug["docs_scopes_count"] = int(((ctx or {}).get("docs") or {}).get("scopes_count") or 0)
+        debug["trial_feedback_prompt_enabled"] = trial_feedback_prompt_enabled
 
         # --- Guardrails MINIMAUX (pas de correction d'intent) ---
 
@@ -1246,7 +1542,7 @@ class OrchestratorAgent:
                 ok=False,
                 language=language or "fr",
                 state=state,
-                intent="general_question",
+                intent="cabinet_assistance",
                 context_level="medium",
                 need_web=False,
                 web_search_prompt=None,

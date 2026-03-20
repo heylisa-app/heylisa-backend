@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dotenv import load_dotenv
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
 import json
@@ -421,6 +421,223 @@ class LLMRuntime:
             )
         return text, meta
 
+    def _extract_stream_delta_text(self, payload: Dict[str, Any]) -> str:
+        """
+        Extrait le texte d'un chunk OpenAI-compatible.
+        Supporte:
+        - delta.content = "..."
+        - delta.content = [{"type":"text","text":"..."}]
+        """
+        try:
+            choices = payload.get("choices") or []
+            if not choices:
+                return ""
+
+            delta = (choices[0] or {}).get("delta") or {}
+            content = delta.get("content")
+
+            if isinstance(content, str):
+                return content
+
+            if isinstance(content, list):
+                parts: List[str] = []
+                for item in content:
+                    if isinstance(item, dict):
+                        txt = item.get("text")
+                        if isinstance(txt, str) and txt:
+                            parts.append(txt)
+                return "".join(parts)
+
+            return ""
+        except Exception:
+            return ""
+
+    async def _stream_one(
+        self,
+        *,
+        provider: Dict[str, Any],
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        url = self._chat_url(provider)
+        headers = self._headers(provider["api_key"])
+
+        body: Dict[str, Any] = {
+            "model": provider["model"],
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        if self._supports_store_param(provider["name"]):
+            body["store"] = False
+
+        timeout = Timeout(
+            connect=DEFAULT_CONNECT_TIMEOUT_S,
+            read=DEFAULT_READ_TIMEOUT_S,
+            write=DEFAULT_WRITE_TIMEOUT_S,
+            pool=DEFAULT_POOL_TIMEOUT_S,
+        )
+
+        t0 = time.time()
+        emitted_any_text = False
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", url, headers=headers, json=body) as r:
+                if r.status_code < 200 or r.status_code >= 300:
+                    try:
+                        err_text = await r.aread()
+                        err_preview = err_text.decode("utf-8", errors="ignore")[:180]
+                    except Exception:
+                        err_preview = ""
+                    raise LLMCallError(f"{provider['name']} HTTP_{r.status_code} {err_preview}")
+
+                yield {
+                    "type": "start",
+                    "provider": provider["name"],
+                    "model": provider["model"],
+                }
+
+                async for raw_line in r.aiter_lines():
+                    line = (raw_line or "").strip()
+                    if not line:
+                        continue
+
+                    if line.startswith(":"):
+                        continue
+
+                    if not line.startswith("data:"):
+                        continue
+
+                    data_str = line[5:].strip()
+                    if not data_str:
+                        continue
+
+                    if data_str == "[DONE]":
+                        duration_ms = int((time.time() - t0) * 1000)
+                        yield {
+                            "type": "end",
+                            "provider": provider["name"],
+                            "model": provider["model"],
+                            "duration_ms": duration_ms,
+                        }
+                        return
+
+                    try:
+                        payload = json.loads(data_str)
+                    except Exception:
+                        continue
+
+                    text = self._extract_stream_delta_text(payload)
+                    if text:
+                        emitted_any_text = True
+                        yield {
+                            "type": "delta",
+                            "text": text,
+                        }
+
+        if not emitted_any_text:
+            raise LLMCallError(f"Empty LLM stream from {provider['name']}")
+
+    async def chat_text_stream(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 800,
+        trace: Optional[Dict[str, Any]] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Stream natif texte.
+        Yield des events internes:
+        - {"type":"start","provider":"...","model":"..."}
+        - {"type":"delta","text":"..."}
+        - {"type":"end","provider":"...","model":"...","duration_ms":1234}
+        """
+        last_err: Optional[Exception] = None
+
+        messages, cap_meta = _normalize_and_cap_messages(messages)
+
+        if self._trace_enabled():
+            print("[LLM_TRACE] prompt_caps", cap_meta.to_dict())
+
+        if trace and trace.get("raw_user_message") is not None:
+            last_user = str(trace.get("raw_user_message") or "").strip()
+        else:
+            last_user = self._last_user_content(messages)
+
+        wc = self._word_count(last_user)
+        short_msg = wc > 0 and wc <= int(_env("LLM_SHORT_MSG_WORDS", "6"))
+
+        is_fastpath_smalltalk_intro = False
+        try:
+            rs = str((trace or {}).get("route_source") or "").strip().lower()
+            st = str((trace or {}).get("runtime_state") or (trace or {}).get("state") or "").strip().lower()
+            is_fastpath_smalltalk_intro = (rs == "fastpath" and st == "smalltalk_intro")
+        except Exception:
+            is_fastpath_smalltalk_intro = False
+
+        providers_to_try = list(self.providers)
+        providers_to_try = [p for p in providers_to_try if p.get("name") in self.chat_provider_allowlist]
+
+        if (
+            is_fastpath_smalltalk_intro
+        ):
+            preferred = ["deepseek", "openai"]
+            name_to_p = {p["name"]: p for p in providers_to_try}
+            ordered = [name_to_p[n] for n in preferred if n in name_to_p]
+            providers_to_try = ordered + [p for p in providers_to_try if p["name"] not in preferred]
+
+        elif short_msg:
+            preferred = ["openai", "deepseek"]
+            name_to_p = {p["name"]: p for p in providers_to_try}
+            ordered = [name_to_p[n] for n in preferred if n in name_to_p]
+            providers_to_try = ordered + [p for p in providers_to_try if p["name"] not in preferred]
+
+        if self._trace_enabled():
+            print(
+                "[LLM_TRACE] provider_routing_stream",
+                {
+                    "last_user_preview": (last_user[:80] + "…") if len(last_user) > 80 else last_user,
+                    "word_count": wc,
+                    "short_msg": short_msg,
+                    "providers_order": [p["name"] for p in providers_to_try if p.get("api_key")],
+                },
+            )
+
+        for provider in providers_to_try:
+            if not provider.get("api_key"):
+                continue
+
+            try:
+                async for event in self._stream_one(
+                    provider=provider,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ):
+                    yield event
+                return
+
+            except Exception as e:
+                last_err = e
+
+                if self._trace_enabled():
+                    print(
+                        "[LLM_TRACE] provider_stream_failed",
+                        {
+                            "provider": provider["name"],
+                            "model": provider.get("model"),
+                            "error_type": type(e).__name__,
+                            "error_preview": str(e)[:200],
+                        },
+                    )
+                continue
+
+        raise LLMCallError(f"All LLM stream providers failed. Last error: {last_err}")
+
     async def chat_json(
         self,
         messages: List[Dict[str, str]],
@@ -494,6 +711,8 @@ class LLMRuntime:
         temperature: float = 0.0,
         max_tokens: int = 900,
         trace: Optional[Dict[str, Any]] = None,
+        provider_allowlist: Optional[set] = None,
+        preferred_order: Optional[List[str]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
         Web search route:
@@ -505,8 +724,8 @@ class LLMRuntime:
             temperature=temperature,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
-            provider_allowlist={"perplexity", "openai"},
-            preferred_order=["perplexity", "openai"],
+            provider_allowlist=provider_allowlist or {"perplexity", "openai"},
+            preferred_order=preferred_order or ["perplexity", "openai"],
         )
 
         content = (
@@ -515,15 +734,56 @@ class LLMRuntime:
             .get("content", "")
         ) or ""
 
-        def _extract_first_json_object(s: str) -> Optional[str]:
-            # récupère le premier {...} “raisonnable”
-            m = re.search(r"\{.*\}", s, flags=re.DOTALL)
-            return m.group(0) if m else None
+        def _strip_code_fences(s: str) -> str:
+            s = (s or "").strip()
+            s = re.sub(r"^```json\s*", "", s, flags=re.IGNORECASE)
+            s = re.sub(r"^```\s*", "", s)
+            s = re.sub(r"\s*```$", "", s)
+            return s.strip()
+
+        def _extract_balanced_json_object(s: str) -> Optional[str]:
+            """
+            Extrait le premier objet JSON équilibré {...}
+            sans se faire piéger par un greedy regex.
+            """
+            s = s or ""
+            start = s.find("{")
+            if start == -1:
+                return None
+
+            depth = 0
+            in_string = False
+            escape = False
+
+            for i in range(start, len(s)):
+                ch = s[i]
+
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return s[start:i + 1]
+
+            return None
+
+        cleaned = _strip_code_fences(content)
 
         try:
-            obj = json.loads(content)
+            obj = json.loads(cleaned)
         except Exception:
-            extracted = _extract_first_json_object(content or "")
+            extracted = _extract_balanced_json_object(cleaned)
             if extracted:
                 try:
                     obj = json.loads(extracted)

@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from asyncpg import Connection
+from typing import AsyncIterator
 
 from app.core.db import get_db_conn  # adapte si ton dépendency s'appelle autrement
 from app.services.chat_intro import handle_chat_intro

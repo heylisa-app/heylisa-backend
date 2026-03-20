@@ -69,6 +69,10 @@ LOG_LEVEL=DEBUG python3 -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8
 cd ~/dev/heylisa-mobile
 npm start
 
+4. pour la webapp:
+cd ~/heylisa-webapp
+npm run dev
+
 ## ⚙️ Setup local
 
 ### 1) Environnement Python
@@ -183,6 +187,442 @@ C) Voir juste les nodes
 python3 -m uvicorn app.main:app --reload --port 8000 | grep '"event": "chat.node.'
 
 (sur mac, grep marche direct)
+
+
+
+
+================================================
+HeyLisa — Sprint 1 Auth & Provisioning
+
+Objectif du sprint
+
+Mettre en place un socle unique d’identité et de provisioning pour HeyLisa Assistante Médicale, partagé entre web, mobile, backend FastAPI, Supabase et la future facturation Stripe.
+
+Ce sprint ne branche pas encore Stripe de manière active. Il prépare un modèle propre pour que :
+	•	un compte créé sur le web puisse se connecter sur l’app,
+	•	un compte créé sur l’app puisse se connecter sur le web,
+	•	chaque nouvel utilisateur crée automatiquement un cabinet,
+	•	chaque cabinet ait un owner/admin initial,
+	•	les objets métier soient cohérents et réutilisables pour les futurs rôles, invitations, abonnements et permissions.
+
+⸻
+
+Principes validés
+
+1. Source de vérité identité
+	•	Supabase Auth (auth.users) = source de vérité pour l’identité technique.
+	•	Web et mobile utilisent le même auth.
+	•	Pas de système parallèle d’auth côté backend.
+
+2. Profil applicatif
+	•	La table users reste le profil applicatif principal, alimenté depuis auth.users.
+	•	La table user_settings continue d’être créée automatiquement à la création d’un user.
+
+3. Entité métier principale
+	•	L’abonnement, la structure et les droits sont portés par cabinet_accounts.
+	•	Un user peut appartenir à un ou plusieurs cabinets à terme.
+	•	Au sprint 1, tout nouveau signup crée 1 cabinet + 1 membership owner/admin.
+
+4. Facturation
+	•	La facturation sera portée par le cabinet, pas par le user isolé.
+	•	Stripe ne sera pas créé au signup.
+	•	La création Stripe sera déclenchée plus tard par Lisa, après la période d’essai de 14 jours, si l’utilisateur confirme qu’il souhaite continuer.
+
+5. Rôle minimal requis au sprint 1
+	•	Chaque cabinet doit avoir un owner/admin initial.
+	•	C’est ce rôle qui pourra fermer/supprimer le compte plus tard.
+	•	Les permissions fines par rôle seront détaillées dans un sprint ultérieur.
+
+⸻
+
+Flow cible Sprint 1
+
+Signup web
+	1.	L’utilisateur remplit le formulaire web.
+	2.	auth.users est créé via Supabase Auth.
+	3.	Email de vérification envoyé.
+	4.	Après confirmation email et première connexion :
+	•	création / mise à jour de users,
+	•	création de user_settings,
+	•	création du cabinet_accounts,
+	•	création du cabinet_members avec rôle owner.
+	5.	Le user peut ensuite se connecter sur web et mobile avec les mêmes credentials.
+
+Signup mobile
+
+Même logique que le signup web.
+
+Login cross-platform
+	•	Signup web => login app OK.
+	•	Signup app => login web OK.
+
+⸻
+
+Décision de modélisation
+
+Hiérarchie
+	•	auth.users → identité technique
+	•	users → profil applicatif
+	•	cabinet_accounts → structure métier
+	•	cabinet_members → lien user ↔ cabinet + rôle
+	•	user_settings → préférences / settings initiaux
+
+⸻
+
+Tables concernées au Sprint 1
+
+1. auth.users
+
+Gérée par Supabase.
+
+Champs clés utilisés :
+	•	id
+	•	email
+	•	email_confirmed_at
+	•	created_at
+	•	raw_user_meta_data (si utile)
+
+2. users
+
+Rôle : profil applicatif lié à auth.users.
+
+Champs minimaux attendus :
+	•	id (PK, = auth.users.id)
+	•	email
+	•	full_name (nullable au début si nécessaire)
+	•	preferred_language (optionnel)
+	•	default_cabinet_account_id (nullable au moment de création, rempli après provisioning)
+	•	onboarding_completed (bool, défaut false)
+	•	created_at
+	•	updated_at
+
+3. user_settings
+
+Rôle : préférences utilisateur.
+
+Champs minimaux attendus :
+	•	user_id (PK/FK vers users.id)
+	•	settings existants conservés si déjà utilisés
+	•	created_at
+	•	updated_at
+
+4. cabinet_accounts
+
+Rôle : entité cabinet / compte principal métier.
+
+Champs minimaux attendus au sprint 1 :
+	•	id (uuid, PK)
+	•	name (nom visible du cabinet)
+	•	legal_name (nullable)
+	•	slug (unique, nullable si généré plus tard)
+	•	website (nullable)
+	•	country_code (nullable)
+	•	main_city (nullable)
+	•	size (nullable)
+	•	owner_user_id (FK vers users.id)
+	•	status (trial, active, disabled, défaut trial)
+	•	trial_started_at
+	•	trial_ends_at
+	•	created_at
+	•	updated_at
+
+5. cabinet_members
+
+Rôle : lien entre users et cabinets.
+
+Champs minimaux attendus :
+	•	id (uuid, PK)
+	•	cabinet_account_id (FK)
+	•	user_id (FK)
+	•	role (owner, admin, member ; au sprint 1 on utilise surtout owner)
+	•	status (active, invited, disabled)
+	•	created_at
+	•	updated_at
+
+Contraintes attendues :
+	•	unicité (cabinet_account_id, user_id)
+
+⸻
+
+Provisioning attendu à la création d’un compte
+
+Cas nominal
+
+Quand un nouveau auth.users est confirmé et se connecte pour la première fois :
+	1.	Créer / upsert users
+	2.	Créer user_settings si absent
+	3.	Créer un cabinet_accounts si aucun cabinet n’existe pour ce user
+	4.	Créer un cabinet_members avec rôle owner
+	5.	Renseigner users.default_cabinet_account_id
+
+Idempotence requise
+
+Le provisioning doit être idempotent.
+Si relancé une seconde fois, il ne doit pas :
+	•	recréer un second cabinet,
+	•	dupliquer le membership,
+	•	casser les données existantes.
+
+⸻
+
+Règles métier validées
+
+Période d’essai
+	•	14 jours d’essai gratuit à la création.
+	•	cabinet_accounts.status = trial
+	•	trial_started_at = created_at
+	•	trial_ends_at = created_at + 14 jours
+
+Activation facturation ultérieure
+
+Après les 14 jours :
+	•	Lisa demande confirmation à l’utilisateur,
+	•	si OK => création Stripe customer + abonnement,
+	•	la vue Facturation devient reliée au vrai portail Stripe.
+
+⸻
+
+Ce qu’on ne fait PAS dans ce sprint
+	•	Permissions fines par rôle
+	•	Invitations collaborateurs complètes
+	•	Stripe customer / subscription active
+	•	Portail Stripe réel
+	•	Billing webhook
+	•	Multi-cabinet complet
+	•	Gestion avancée des rôles médicaux
+
+⸻
+
+Questions déjà tranchées
+	•	Le royaume de la connexion = Supabase Auth
+	•	users reste la projection applicative du user auth
+	•	users doit être reliée à cabinet_accounts
+	•	Chaque cabinet doit avoir un owner/admin initial
+	•	La facturation sera portée par le cabinet
+	•	Stripe sera déclenché plus tard par Lisa, pas au signup
+
+⸻
+
+Étapes d’implémentation prévues
+
+Étape 1
+
+Valider la structure cible exacte des tables du sprint 1.
+
+Étape 2
+
+Créer/ajuster les colonnes, contraintes, index et FKs nécessaires.
+
+Étape 3
+
+Implémenter le provisioning automatique idempotent.
+
+Étape 4
+
+Brancher signup/login web sur ce modèle.
+
+Étape 5
+
+Brancher signup/login mobile sur le même modèle.
+
+Étape 6
+
+Tester les scénarios croisés web ↔ mobile.
+
+⸻
+
+Implémentation validée — étape SQL structure Sprint 1
+
+Décision
+
+Nettoyage assumé des tables héritées pour repartir sur un socle strictement utile au sprint 1.
+
+Tables retenues
+	•	users
+	•	cabinet_accounts
+	•	cabinet_members (recréée proprement)
+
+Principes appliqués
+	•	suppression des colonnes héritées inutiles au sprint 1
+	•	suppression des triggers hérités liés à Stripe / affiliate / statut legacy
+	•	ajout des colonnes minimales métier nécessaires
+	•	ajout des FK, index et contraintes utiles
+	•	pas de déduplication des cabinets par email owner
+	•	un email = un compte auth unique, mais plusieurs entités/cabinets pourront être créés plus tard depuis ce compte
+
+Points d’attention
+	•	migration destructive assumée
+	•	à exécuter d’abord en environnement dev/staging
+	•	vérifier ensuite le provisioning automatique après email confirmé
+
+TODO doc
+
+À compléter après exécution :
+	•	timestamp d’exécution de la migration
+	•	environnement cible exécuté
+	•	résultat des tests signup web
+	•	résultat des tests signup mobile
+	•	résultat des tests provisioning idempotent
+	•	écarts éventuels découverts
+=================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+À froid, ton backlog se découpe très bien en 4 blocs de lancement :
+
+Bloc 1 — garde-fous produit indispensables
+
+C’est ce qui évite une app bancale ou incohérente au launch :
+	1.	intent hors cadre pro/médical => DONE
+	2.  Fix lisa is thinking chat intro
+	3.	paywall essai gratuit → continuité ou blocage
+	4.	mode preview → données fake au départ, disparition dès première vraie donnée
+	5.	vue Support humain propre avec Calendly bien intégré
+	  
+
+Bloc 2 — tuyauterie d’orchestration interne
+
+C’est ce qui rend Lisa exploitable côté ops :
+5. payload + webhook pour brief automation
+6. payload + webhook pour suivi des tâches
+7. workflows n8n liés aux webhooks, y compris user_facts
+
+Bloc 3 — capacités cœur produit
+
+C’est ce qui transforme Lisa en vraie assistante cabinet :
+8. PJ + notes audio
+8bis. ajouter insight études sur symptomes (anatomie)
+9. intégrations Google / Outlook / Doctolib
+10. flow complet gestion des mails cabinet
+
+Bloc 4 — profondeur produit + crédibilité
+
+C’est ce qui fait monter le niveau perçu :
+11. vue Patients réellement animée
+12. vue Dashboard
+13. documentation HeyLisa pour alimenter Lisa
+
+Mon avis franc sur l’ordre de reprise
+
+Au redémarrage, je te conseille qu’on reparte dans cet ordre précis :
+
+A. Hors cadre + paywall + preview
+B. Support humain
+C. Webhooks internes automation / tâches / user_facts
+D. PJ + audio
+E. Agendas + mails cabinet
+F. Patients + dashboard
+G. Documentation HeyLisa
+
+Pourquoi cet ordre ?
+Parce que A+B+C sécurisent le launch.
+Le reste augmente la puissance produit, mais ne doit pas casser le cadre.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 Règles Quota (v1)

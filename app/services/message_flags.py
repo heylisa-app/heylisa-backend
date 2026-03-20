@@ -1,4 +1,3 @@
-# app/services/message_flags.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,25 +6,29 @@ import re
 
 # Match une ligne "flag=true" (avec espaces, casse, etc.)
 _FLAG_LINE_RE = re.compile(
-    r"""(?im)^\s*(aha_moment|aha_request|onboarding_abort)\s*=\s*(true|false|1|0)\s*$"""
+    r"""(?im)^\s*(aha_moment|aha_request|discovery_abort|trial_feedback)\s*=\s*(true|false|1|0)\s*$"""
 )
+
 
 @dataclass
 class MessageFlags:
     aha_request: bool = False
     aha_moment: bool = False
-    onboarding_abort: bool = False
+    discovery_abort: bool = False
+    trial_feedback: bool = False
 
     def to_metadata(self) -> Dict[str, Any]:
         return {
             "aha_request": bool(self.aha_request),
             "aha_moment": bool(self.aha_moment),
-            "onboarding_abort": bool(self.onboarding_abort),
+            "discovery_abort": bool(self.discovery_abort),
+            "trial_feedback": bool(self.trial_feedback),
         }
+
 
 def extract_and_clean_message_flags(text: str) -> tuple[str, MessageFlags]:
     """
-    - Détecte les flags (lignes seules) : aha_moment=..., onboarding_abort=...
+    - Détecte les flags (lignes seules) : aha_moment=..., discovery_abort=..., trial_feedback=...
     - Les retire du texte
     - Retourne (clean_text, flags)
     """
@@ -51,8 +54,10 @@ def extract_and_clean_message_flags(text: str) -> tuple[str, MessageFlags]:
             flags.aha_request = flags.aha_request or val
         elif key == "aha_moment":
             flags.aha_moment = flags.aha_moment or val
-        elif key == "onboarding_abort":
-            flags.onboarding_abort = flags.onboarding_abort or val
+        elif key == "discovery_abort":
+            flags.discovery_abort = flags.discovery_abort or val
+        elif key == "trial_feedback":
+            flags.trial_feedback = flags.trial_feedback or val
 
         # on ne garde pas cette ligne
 

@@ -8,6 +8,7 @@ NODE_TYPE_WHITELIST: Final[Tuple[str, ...]] = (
     "tool.db_load_context",
     "tool.quota_check",
     "tool.web_search",
+    "tool.web_search_medical",  # ✅ NEW
     "agent.response_writer",
     "tool.docs_chunks",
     "tool.onboarding_set_fields",

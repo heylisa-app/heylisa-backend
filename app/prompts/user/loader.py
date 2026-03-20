@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Literal
 
-from app.prompts.user.v1.registry import (
+from app.prompts.user.v2.registry import (
     USER_BLOCKS_BY_STATE,
     USER_BLOCKS_BY_INTENT,
     USER_BLOCKS_MISC,
