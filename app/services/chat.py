@@ -6,7 +6,7 @@ from asyncpg import Connection
 from app.llm.runtime import LLMRuntime
 from app.agents.orchestrator import OrchestratorAgent
 from app.services.plan_executor import PlanExecutor
-from app.services.context_loader_v2 import load_context_light, load_context_with_billing
+from app.services.context_loader_v2 import load_context_with_billing
 from typing import AsyncIterator
 
 from app.core.chat_logger import chat_logger
@@ -15,8 +15,10 @@ from app.services.message_flags import extract_and_clean_message_flags
 from app.services.intent_routing.state_resolver_v2 import resolve_state_v2
 from app.services.intent_routing.gates import apply_gates
 from app.services.onboarding_state import apply_onboarding_state
-from app.llm.runtime import LLMCallError
 from app.integrations.n8n_feedback_analysis import fire_feedback_analysis_webhook
+
+from app.integrations.n8n_task_execution import fire_task_execution_webhook
+from app.integrations.n8n_custom_request import fire_custom_request_webhook
 
 SAFE_FALLBACK_ANSWER = "Désolé — je n’ai pas réussi à générer une réponse. Réessaie."
 TRIAL_FEEDBACK_BILLING_ALLOWED = {
@@ -197,6 +199,25 @@ async def _compute_trial_feedback_flag(
         "billing_substatus": billing_substatus or None,
     }
 
+def _extract_task_execution_context_from_orch(orch) -> dict:
+    try:
+        plan = getattr(orch, "plan", None)
+        if not isinstance(plan, dict):
+            return {}
+
+        for node in plan.get("nodes", []):
+            if isinstance(node, dict) and node.get("type") == "agent.response_writer":
+                inputs = node.get("inputs") or {}
+                if isinstance(inputs, dict):
+                    tec = inputs.get("task_execution_context")
+                    if isinstance(tec, dict):
+                        return tec
+
+        return {}
+
+    except Exception:
+        return {}
+
 async def _insert_or_update_assistant_message(
     conn: Connection,
     *,
@@ -229,9 +250,67 @@ async def _insert_or_update_assistant_message(
     if not intent_final:
         intent_final = getattr(orch, "intent", None)
 
+    # -----------------------------
+    # Resolve brain metadata
+    # -----------------------------
+    runtime_state = None
+    primary_brain_key = None
+    secondary_brain_key = None
+    secondary_brain_reason = None
+    resume_loop_id = None
+    keep_warm_topic = False
+
+    try:
+        for n in (orch.plan or {}).get("nodes", []):
+            if isinstance(n, dict) and n.get("type") == "agent.response_writer":
+                inputs = n.get("inputs") or {}
+                if isinstance(inputs, dict):
+                    runtime_state = inputs.get("runtime_state") or inputs.get("state")
+                    primary_brain_key = inputs.get("primary_brain_key")
+                    secondary_brain_key = inputs.get("secondary_brain_key")
+                    secondary_brain_reason = inputs.get("secondary_brain_reason")
+                    resume_loop_id = inputs.get("resume_loop_id")
+                    keep_warm_topic = bool(inputs.get("keep_warm_topic") is True)
+                    break
+    except Exception:
+        runtime_state = None
+        primary_brain_key = None
+        secondary_brain_key = None
+        secondary_brain_reason = None
+        resume_loop_id = None
+        keep_warm_topic = False
+
+    def resolve_brain_key(
+        intent: str | None,
+        runtime_state: str | None,
+        primary_brain_key: str | None,
+    ) -> str:
+        if primary_brain_key:
+            return str(primary_brain_key)
+
+        if runtime_state == "smalltalk_onboarding":
+            return "smalltalk_onboarding"
+        if runtime_state == "discovery_capabilities":
+            return "discovery_capabilities"
+        if intent == "cabinet_assistance":
+            return "cabinet_assistance"
+        return "default"
+
+    brain_key = resolve_brain_key(intent_final, runtime_state, primary_brain_key)
+
     assistant_meta = {
         "event_type": "backend_chat",
         "provider": provider,
+        "brain": {
+            "brain_key": brain_key,
+            "primary_brain_key": str(primary_brain_key or ""),
+            "secondary_brain_key": str(secondary_brain_key or ""),
+            "secondary_brain_reason": str(secondary_brain_reason or ""),
+            "resume_loop_id": str(resume_loop_id or ""),
+            "keep_warm_topic": bool(keep_warm_topic),
+            "intent": str(intent_final or ""),
+            "runtime_state": str(runtime_state or ""),
+        },
         "orch": {
             "intent_final": str(intent_final or ""),
             "mode": str(mode or ""),
@@ -288,6 +367,8 @@ async def _postprocess_assistant_message(
     ctx: dict,
     provider: dict,
     msg,
+    reply_text: str,
+    orch,
     conversation_id: str,
     user_message_id: str,
     assistant_message_id: str,
@@ -350,9 +431,9 @@ async def _postprocess_assistant_message(
                 "cabinet_account_id": ((ctx or {}).get("cabinet") or {}).get("id"),
                 "member_role": ((ctx or {}).get("member") or {}).get("role"),
                 "member_job_role": ((ctx or {}).get("member") or {}).get("job_role"),
-                "billing_status": ((ctx or {}).get("conversation_flags") or {}).get("billing_status"),
-                "billing_substatus": ((ctx or {}).get("conversation_flags") or {}).get("billing_substatus"),
-                "trial_feedback_active": ((ctx or {}).get("conversation_flags") or {}).get("trial_feedback_active"),
+                "billing_status": ((ctx or {}).get("gates") or {}).get("billing_status"),
+                "billing_substatus": ((ctx or {}).get("gates") or {}).get("billing_substatus"),
+                "trial_feedback_active": ((ctx or {}).get("gates") or {}).get("trial_feedback_active"),
             }
 
             chat_logger.info(
@@ -370,6 +451,116 @@ async def _postprocess_assistant_message(
 
     except Exception as e:
         chat_logger.info("feedback_analysis.webhook.call_error", error=str(e)[:180])
+
+try:
+    provider_flags = ((provider or {}).get("flags") or {})
+    raw_task_execution_flag = bool(provider_flags.get("task_to_execute") is True)
+    raw_custom_request_flag = bool(provider_flags.get("custom_request") is True)
+
+    task_execution_context = _extract_task_execution_context_from_orch(orch)
+
+    task_detected = bool((task_execution_context or {}).get("task_detected") is True)
+    task_key = str((task_execution_context or {}).get("task_key") or "").strip()
+    task_status = str((task_execution_context or {}).get("task_status") or "").strip().lower()
+    can_execute_now = bool((task_execution_context or {}).get("can_execute_now") is True)
+
+    # -----------------------------------
+    # Verrous déterministes backend
+    # -----------------------------------
+    effective_task_execution = bool(
+        raw_task_execution_flag
+        and task_detected
+        and bool(task_key)
+        and task_status == "active"
+        and can_execute_now
+    )
+
+    effective_custom_request = bool(
+        raw_custom_request_flag
+        and not effective_task_execution
+        and (
+            (not task_detected)
+            or task_status in {"unknown", "disabled", ""}
+        )
+    )
+
+    chat_logger.info(
+        "task_hooks.flags.resolved",
+        raw_task_execution_flag=raw_task_execution_flag,
+        raw_custom_request_flag=raw_custom_request_flag,
+        effective_task_execution=effective_task_execution,
+        effective_custom_request=effective_custom_request,
+        task_key=task_key or None,
+        task_status=task_status or None,
+        task_detected=task_detected,
+        can_execute_now=can_execute_now,
+        task_execution_context=task_execution_context,
+    )
+
+    if effective_task_execution:
+        payload = {
+            "source": "chat_task_execution",
+            "public_user_id": str(public_user_id),
+            "conversation_id": str(conversation_id),
+            "conversation_channel": ((ctx or {}).get("conversation") or {}).get("channel"),
+            "user_message_id": str(user_message_id),
+            "assistant_message_id": str(assistant_message_id),
+            "user_text": (msg["content"] or ""),
+            "assistant_text": reply_text,
+            "cabinet_account_id": ((ctx or {}).get("cabinet") or {}).get("id"),
+            "member_role": ((ctx or {}).get("member") or {}).get("role"),
+            "member_job_role": ((ctx or {}).get("member") or {}).get("job_role"),
+            "task_execution_context": task_execution_context,
+        }
+
+        chat_logger.info(
+            "task_execution.hook.payload_ready",
+            public_user_id=str(public_user_id),
+            conversation_id=str(conversation_id),
+            user_message_id=str(user_message_id),
+            assistant_message_id=str(assistant_message_id),
+            task_key=task_key or None,
+            task_status=task_status or None,
+        )
+
+        import asyncio
+        asyncio.create_task(fire_task_execution_webhook(payload))
+
+        chat_logger.info("task_execution.hook.task_scheduled")
+
+    if effective_custom_request:
+        payload = {
+            "source": "chat_custom_request",
+            "public_user_id": str(public_user_id),
+            "conversation_id": str(conversation_id),
+            "conversation_channel": ((ctx or {}).get("conversation") or {}).get("channel"),
+            "user_message_id": str(user_message_id),
+            "assistant_message_id": str(assistant_message_id),
+            "user_text": (msg["content"] or ""),
+            "assistant_text": reply_text,
+            "cabinet_account_id": ((ctx or {}).get("cabinet") or {}).get("id"),
+            "member_role": ((ctx or {}).get("member") or {}).get("role"),
+            "member_job_role": ((ctx or {}).get("member") or {}).get("job_role"),
+            "task_execution_context": task_execution_context,
+        }
+
+        chat_logger.info(
+            "custom_request.hook.payload_ready",
+            public_user_id=str(public_user_id),
+            conversation_id=str(conversation_id),
+            user_message_id=str(user_message_id),
+            assistant_message_id=str(assistant_message_id),
+            task_key=task_key or None,
+            task_status=task_status or None,
+        )
+
+        import asyncio
+        asyncio.create_task(fire_custom_request_webhook(payload))
+
+        chat_logger.info("custom_request.hook.task_scheduled")
+
+except Exception as e:
+    chat_logger.info("task_hooks.webhook.call_error", error=str(e)[:180])
 
 
 async def _persist_onboarding_flags(
@@ -468,7 +659,7 @@ async def _persist_onboarding_flags(
                 row=dict(row) if row else None,
             )
 
-        elif flags_meta.get("discovery_abort") is True:
+        if flags_meta.get("discovery_abort") is True:
             updated_user_id = await conn.fetchval(
                 """
                 update public.user_onboarding_state
@@ -538,7 +729,13 @@ def _build_failsafe_light_plan(*, ctx: dict, state_decision, soft_paywall_warnin
             "depends_on": ["A"],
             "inputs": {
                 "intent": "",                     # pas d'overlay intent
-                "mode": forced_state,             # state = mode
+                "primary_brain_key": None,
+                "secondary_brain_key": None,
+                "secondary_brain_reason": None,
+                "resume_loop_id": None,
+                "keep_warm_topic": False,
+                "mode": forced_state,
+                "task_execution_context": None,             # state = mode
                 "route_source": "failsafe",       # traçable
                 "runtime_state": forced_state,    # source de vérité RW
                 "state": forced_state,            # idem
@@ -685,9 +882,16 @@ async def handle_chat_message_stream(
                 "depends_on": deps,
                 "inputs": {
                     "intent": intent,
+                    "primary_brain_key": None,
+                    "secondary_brain_key": None,
+                    "secondary_brain_reason": None,
+                    "resume_loop_id": None,
+                    "keep_warm_topic": False,
                     "mode": mode,
+                    "task_execution_context": None,
                     "route_source": "fastpath",
                     "runtime_state": str(state_decision.state),
+                    "state": str(state_decision.state),
                     "language": language,
                     "tone": "warm",
                     "need_web": False,
@@ -702,6 +906,11 @@ async def handle_chat_message_stream(
         plan = {"nodes": nodes}
 
         orch = type("OrchStub", (), {})()
+        orch.primary_brain_key = None
+        orch.secondary_brain_key = None
+        orch.secondary_brain_reason = None
+        orch.resume_loop_id = None
+        orch.keep_warm_topic = False
         orch.ok = True
         orch.intent = intent
         orch.language = language
@@ -710,6 +919,11 @@ async def handle_chat_message_stream(
         orch.plan = plan
         orch.debug = {
             "intent_final": intent,
+            "primary_brain_key": None,
+            "secondary_brain_key": None,
+            "secondary_brain_reason": None,
+            "resume_loop_id": None,
+            "keep_warm_topic": False,
             "mode": mode,
             "meta": {"provider": "fastpath"},
         }
@@ -719,6 +933,11 @@ async def handle_chat_message_stream(
 
         try:
             orch = await orchestrator.run(user_message=msg["content"], ctx=ctx)
+            orch.primary_brain_key = getattr(orch, "debug", {}).get("primary_brain_key")
+            orch.secondary_brain_key = getattr(orch, "debug", {}).get("secondary_brain_key")
+            orch.secondary_brain_reason = getattr(orch, "debug", {}).get("secondary_brain_reason")
+            orch.resume_loop_id = getattr(orch, "debug", {}).get("resume_loop_id")
+            orch.keep_warm_topic = bool(getattr(orch, "debug", {}).get("keep_warm_topic") is True)
         except Exception as e:
             chat_logger.error(
                 "chat.orchestrator.failsafe_triggered",
@@ -737,6 +956,11 @@ async def handle_chat_message_stream(
 
             orch = type("OrchStub", (), {})()
             orch.ok = False
+            orch.primary_brain_key = None
+            orch.secondary_brain_key = None
+            orch.secondary_brain_reason = None
+            orch.resume_loop_id = None
+            orch.keep_warm_topic = False
             orch.intent = ""
             orch.language = (((ctx or {}).get("settings") or {}).get("locale_main", "fr").split("-")[0]) or "fr"
             orch.need_web = False
@@ -744,6 +968,11 @@ async def handle_chat_message_stream(
             orch.plan = plan
             orch.debug = {
                 "intent_final": "",
+                "primary_brain_key": None,
+                "secondary_brain_key": None,
+                "secondary_brain_reason": None,
+                "resume_loop_id": None,
+                "keep_warm_topic": False,
                 "mode": str(getattr(state_decision, "state", "") or "normal"),
                 "meta": {"provider": "failsafe"},
                 "error_type": type(e).__name__,
@@ -762,6 +991,12 @@ async def handle_chat_message_stream(
                             inputs["soft_paywall_warning"] = soft_paywall_warning
                             inputs["transition_window"] = bool(getattr(state_decision, "transition_window", False))
                             inputs["transition_reason"] = getattr(state_decision, "transition_reason", None)
+                            inputs["primary_brain_key"] = getattr(orch, "primary_brain_key", None)
+                            inputs["secondary_brain_key"] = getattr(orch, "secondary_brain_key", None)
+                            inputs["secondary_brain_reason"] = getattr(orch, "secondary_brain_reason", None)
+                            inputs["resume_loop_id"] = getattr(orch, "resume_loop_id", None)
+                            inputs["keep_warm_topic"] = bool(getattr(orch, "keep_warm_topic", False))
+
                             n["inputs"] = inputs
         except Exception:
             pass
@@ -801,6 +1036,11 @@ async def handle_chat_message_stream(
             orchestrator = OrchestratorAgent(llm)
             ctx["runtime_state"] = {"state": str(getattr(state_decision, "state", "") or "")}
             orch = await orchestrator.run(user_message=msg["content"], ctx=ctx)
+            orch.primary_brain_key = getattr(orch, "debug", {}).get("primary_brain_key")
+            orch.secondary_brain_key = getattr(orch, "debug", {}).get("secondary_brain_key")
+            orch.secondary_brain_reason = getattr(orch, "debug", {}).get("secondary_brain_reason")
+            orch.resume_loop_id = getattr(orch, "debug", {}).get("resume_loop_id")
+            orch.keep_warm_topic = bool(getattr(orch, "debug", {}).get("keep_warm_topic") is True)
 
             try:
                 if isinstance(getattr(orch, "plan", None), dict):
@@ -810,9 +1050,19 @@ async def handle_chat_message_stream(
                             if isinstance(inputs, dict):
                                 inputs["route_source"] = "orchestrator"
                                 inputs["runtime_state"] = str(getattr(state_decision, "state", "") or "")
+                                inputs["state"] = str(getattr(state_decision, "state", "") or "")
                                 inputs["soft_paywall_warning"] = soft_paywall_warning
                                 inputs["transition_window"] = bool(getattr(state_decision, "transition_window", False))
                                 inputs["transition_reason"] = getattr(state_decision, "transition_reason", None)
+                                inputs["primary_brain_key"] = getattr(orch, "primary_brain_key", None)
+                                inputs["secondary_brain_key"] = getattr(orch, "secondary_brain_key", None)
+                                inputs["secondary_brain_reason"] = getattr(orch, "secondary_brain_reason", None)
+                                inputs["resume_loop_id"] = getattr(orch, "resume_loop_id", None)
+                                inputs["keep_warm_topic"] = bool(getattr(orch, "keep_warm_topic", False))
+                                inputs.setdefault("secondary_brain_reason", getattr(orch, "secondary_brain_reason", None))
+                                inputs.setdefault("resume_loop_id", getattr(orch, "resume_loop_id", None))
+                                inputs.setdefault("keep_warm_topic", getattr(orch, "keep_warm_topic", False))
+
                                 n["inputs"] = inputs
             except Exception:
                 pass
@@ -873,6 +1123,8 @@ async def handle_chat_message_stream(
         ctx=ctx,
         provider=provider,
         msg=msg,
+        reply_text=reply_text,
+        orch=orch,
         conversation_id=str(conversation_id),
         user_message_id=str(user_message_id),
         assistant_message_id=str(persisted["assistant_message_id"]),
@@ -1156,9 +1408,16 @@ async def handle_chat_message(
                 "depends_on": deps,
                 "inputs": {
                     "intent": intent,
+                    "primary_brain_key": None,
+                    "secondary_brain_key": None,
+                    "secondary_brain_reason": None,
+                    "resume_loop_id": None,
+                    "keep_warm_topic": False,
                     "mode": mode,
+                    "task_execution_context": None,
                     "route_source": "fastpath",
                     "runtime_state": str(state_decision.state),
+                    "state": str(state_decision.state),
                     "language": language,
                     "tone": "warm",
                     "need_web": False,
@@ -1174,6 +1433,11 @@ async def handle_chat_message(
 
         orch = type("OrchStub", (), {})()
         orch.ok = True
+        orch.primary_brain_key = None
+        orch.secondary_brain_key = None
+        orch.secondary_brain_reason = None
+        orch.resume_loop_id = None
+        orch.keep_warm_topic = False
         orch.intent = intent
         orch.language = language
         orch.need_web = False
@@ -1203,6 +1467,11 @@ async def handle_chat_message(
 
         try:
             orch = await orchestrator.run(user_message=msg["content"], ctx=ctx)
+            orch.primary_brain_key = getattr(orch, "debug", {}).get("primary_brain_key")
+            orch.secondary_brain_key = getattr(orch, "debug", {}).get("secondary_brain_key")
+            orch.secondary_brain_reason = getattr(orch, "debug", {}).get("secondary_brain_reason")
+            orch.resume_loop_id = getattr(orch, "debug", {}).get("resume_loop_id")
+            orch.keep_warm_topic = bool(getattr(orch, "debug", {}).get("keep_warm_topic") is True)
 
         except Exception as e:
             # ✅ FAIL-SAFE : on ne laisse jamais le chat crasher si l'orchestrator tombe
@@ -1225,6 +1494,11 @@ async def handle_chat_message(
             # Stub orch compatible avec le reste du pipeline
             orch = type("OrchStub", (), {})()
             orch.ok = False
+            orch.primary_brain_key = None
+            orch.secondary_brain_key = None
+            orch.secondary_brain_reason = None
+            orch.resume_loop_id = None
+            orch.keep_warm_topic = False
             orch.intent = ""
             orch.language = (((ctx or {}).get("settings") or {}).get("locale_main", "fr").split("-")[0]) or "fr"
             orch.need_web = False
@@ -1251,6 +1525,11 @@ async def handle_chat_message(
                             inputs["soft_paywall_warning"] = soft_paywall_warning
                             inputs["transition_window"] = bool(getattr(state_decision, "transition_window", False))
                             inputs["transition_reason"] = getattr(state_decision, "transition_reason", None)
+                            inputs["primary_brain_key"] = getattr(orch, "primary_brain_key", None)
+                            inputs["secondary_brain_key"] = getattr(orch, "secondary_brain_key", None)
+                            inputs["secondary_brain_reason"] = getattr(orch, "secondary_brain_reason", None)
+                            inputs["resume_loop_id"] = getattr(orch, "resume_loop_id", None)
+                            inputs["keep_warm_topic"] = bool(getattr(orch, "keep_warm_topic", False))
                             n["inputs"] = inputs
         except Exception:
             pass
@@ -1273,6 +1552,8 @@ async def handle_chat_message(
                 rw_route_source=str((rw_inputs or {}).get("route_source") or ""),
                 rw_intent=str((rw_inputs or {}).get("intent") or ""),
                 rw_mode=str((rw_inputs or {}).get("mode") or ""),
+                rw_has_task_execution_context=bool((rw_inputs or {}).get("task_execution_context")),
+                rw_task_execution_context=(rw_inputs or {}).get("task_execution_context"),
             )
         except Exception:
             pass
@@ -1345,6 +1626,11 @@ async def handle_chat_message(
                 ctx = ctx or {}
                 ctx["runtime_state"] = {"state": str(getattr(state_decision, "state", "") or "")}
                 orch = await orchestrator.run(user_message=msg["content"], ctx=ctx)
+                orch.primary_brain_key = getattr(orch, "debug", {}).get("primary_brain_key")
+                orch.secondary_brain_key = getattr(orch, "debug", {}).get("secondary_brain_key")
+                orch.secondary_brain_reason = getattr(orch, "debug", {}).get("secondary_brain_reason")
+                orch.resume_loop_id = getattr(orch, "debug", {}).get("resume_loop_id")
+                orch.keep_warm_topic = bool(getattr(orch, "debug", {}).get("keep_warm_topic") is True)
 
                 # patch plan: enforce route_source orchestrator
                 try:
@@ -1353,11 +1639,18 @@ async def handle_chat_message(
                             if isinstance(n, dict) and n.get("type") == "agent.response_writer":
                                 inputs = n.get("inputs") or {}
                                 if isinstance(inputs, dict):
+                                    forced_state = str(getattr(state_decision, "state", "") or "")
                                     inputs["route_source"] = "orchestrator"
-                                    inputs["runtime_state"] = str(getattr(state_decision, "state", "") or "")
+                                    inputs["runtime_state"] = forced_state
+                                    inputs["state"] = forced_state
                                     inputs["soft_paywall_warning"] = soft_paywall_warning
                                     inputs["transition_window"] = bool(getattr(state_decision, "transition_window", False))
                                     inputs["transition_reason"] = getattr(state_decision, "transition_reason", None)
+                                    inputs["primary_brain_key"] = getattr(orch, "primary_brain_key", None)
+                                    inputs["secondary_brain_key"] = getattr(orch, "secondary_brain_key", None)
+                                    inputs["secondary_brain_reason"] = getattr(orch, "secondary_brain_reason", None)
+                                    inputs["resume_loop_id"] = getattr(orch, "resume_loop_id", None)
+                                    inputs["keep_warm_topic"] = bool(getattr(orch, "keep_warm_topic", False))
                                     n["inputs"] = inputs
                 except Exception:
                     pass
@@ -1446,11 +1739,67 @@ async def handle_chat_message(
     if not intent_final:
         intent_final = getattr(orch, "intent", None)
 
+    # -----------------------------
+    # Resolve brain metadata
+    # -----------------------------
+    runtime_state = None
+    primary_brain_key = None
+    secondary_brain_key = None
+    secondary_brain_reason = None
+    resume_loop_id = None
+    keep_warm_topic = False
+
+    try:
+        for n in (orch.plan or {}).get("nodes", []):
+            if isinstance(n, dict) and n.get("type") == "agent.response_writer":
+                inputs = n.get("inputs") or {}
+                if isinstance(inputs, dict):
+                    runtime_state = inputs.get("runtime_state") or inputs.get("state")
+                    primary_brain_key = inputs.get("primary_brain_key")
+                    secondary_brain_key = inputs.get("secondary_brain_key")
+                    secondary_brain_reason = inputs.get("secondary_brain_reason")
+                    resume_loop_id = inputs.get("resume_loop_id")
+                    keep_warm_topic = bool(inputs.get("keep_warm_topic") is True)
+                    break
+    except Exception:
+        runtime_state = None
+        primary_brain_key = None
+        secondary_brain_key = None
+        secondary_brain_reason = None
+        resume_loop_id = None
+        keep_warm_topic = False
+
+    def resolve_brain_key(
+        intent: str | None,
+        runtime_state: str | None,
+        primary_brain_key: str | None,
+    ) -> str:
+        if primary_brain_key:
+            return str(primary_brain_key)
+
+        if runtime_state == "smalltalk_onboarding":
+            return "smalltalk_onboarding"
+        if runtime_state == "discovery_capabilities":
+            return "discovery_capabilities"
+        if intent == "cabinet_assistance":
+            return "cabinet_assistance"
+        return "default"
+
+    brain_key = resolve_brain_key(intent_final, runtime_state, primary_brain_key)
+
     assistant_meta = {
         "event_type": "backend_chat",
         "provider": provider,
-
-        # continuity keys
+        "brain": {
+            "brain_key": brain_key,
+            "primary_brain_key": str(primary_brain_key or ""),
+            "secondary_brain_key": str(secondary_brain_key or ""),
+            "secondary_brain_reason": str(secondary_brain_reason or ""),
+            "resume_loop_id": str(resume_loop_id or ""),
+            "keep_warm_topic": bool(keep_warm_topic),
+            "intent": str(intent_final or ""),
+            "runtime_state": str(runtime_state or ""),
+        },
         "orch": {
             "intent_final": str(intent_final or ""),
             "mode": str(mode or ""),
@@ -1485,36 +1834,18 @@ async def handle_chat_message(
         flags_meta=provider.get("flags", {}) or {},
     )
 
-    # 6bis) Fire-and-forget user facts catcher (must not impact chat latency)
-    chat_logger.info("userfacts.hook.before", conversation_id=str(conversation_id), user_message_id=str(user_message_id))
-
-    try:
-        payload = {
-            "source": "chat_message",
-            "public_user_id": str(public_user_id),
-            "conversation_id": str(conversation_id),
-            "conversation_channel": ((ctx or {}).get("conversation") or {}).get("channel"),
-            "user_message_id": str(user_message_id),
-            "assistant_message_id": str(assistant_message_id),
-            "user_text": (msg["content"] or ""),
-            "assistant_text": reply_text,
-            "locale": ((ctx or {}).get("settings") or {}).get("locale_main"),
-            "timezone": ((ctx or {}).get("settings") or {}).get("timezone"),
-            "cabinet_account_id": ((ctx or {}).get("cabinet") or {}).get("id"),
-            "member_role": ((ctx or {}).get("member") or {}).get("role"),
-            "member_job_role": ((ctx or {}).get("member") or {}).get("job_role"),
-        }
-
-        chat_logger.info("userfacts.hook.payload_ready", public_user_id=str(public_user_id))
-
-        # ✅ IMPORTANT : si fire_userfact_webhook est async -> create_task
-        import asyncio
-        asyncio.create_task(fire_userfact_webhook(payload))
-
-        chat_logger.info("userfacts.hook.task_scheduled")
-
-    except Exception as e:
-        chat_logger.info("userfacts.webhook.call_error", error=str(e)[:180])
+    await _postprocess_assistant_message(
+        conn,
+        public_user_id=str(public_user_id),
+        ctx=ctx,
+        provider=provider,
+        msg=msg,
+        reply_text=reply_text,
+        orch=orch,
+        conversation_id=str(conversation_id),
+        user_message_id=str(user_message_id),
+        assistant_message_id=str(assistant_message_id),
+    )
 
     # 7) Update user msg metadata with assistant id (idempotence marker)
     # We merge existing metadata (best effort)

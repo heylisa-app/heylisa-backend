@@ -1,3 +1,5 @@
+#app/services/message_flags.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,7 +8,7 @@ import re
 
 # Match une ligne "flag=true" (avec espaces, casse, etc.)
 _FLAG_LINE_RE = re.compile(
-    r"""(?im)^\s*(aha_moment|aha_request|discovery_abort|trial_feedback)\s*=\s*(true|false|1|0)\s*$"""
+    r"""(?im)^\s*(aha_moment|aha_request|discovery_abort|trial_feedback|task_to_execute|custom_request)\s*=\s*(true|false|1|0)\s*$"""
 )
 
 
@@ -16,6 +18,8 @@ class MessageFlags:
     aha_moment: bool = False
     discovery_abort: bool = False
     trial_feedback: bool = False
+    task_to_execute: bool = False
+    custom_request: bool = False
 
     def to_metadata(self) -> Dict[str, Any]:
         return {
@@ -23,6 +27,8 @@ class MessageFlags:
             "aha_moment": bool(self.aha_moment),
             "discovery_abort": bool(self.discovery_abort),
             "trial_feedback": bool(self.trial_feedback),
+            "task_to_execute": bool(self.task_to_execute),
+            "custom_request": bool(self.custom_request),
         }
 
 
@@ -58,6 +64,10 @@ def extract_and_clean_message_flags(text: str) -> tuple[str, MessageFlags]:
             flags.discovery_abort = flags.discovery_abort or val
         elif key == "trial_feedback":
             flags.trial_feedback = flags.trial_feedback or val
+        elif key == "task_to_execute":
+            flags.task_to_execute = flags.task_to_execute or val
+        elif key == "custom_request":
+            flags.custom_request = flags.custom_request or val
 
         # on ne garde pas cette ligne
 

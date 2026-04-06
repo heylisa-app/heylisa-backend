@@ -251,15 +251,26 @@ class PlanExecutor:
         return dict(
             user_message=self.user_message,
             raw_user_message=self.user_message,
+
             intent=rw_intent,
             mode=str(inputs.get("mode") or "normal"),
             language=str(inputs.get("language") or "fr"),
             tone=str(inputs.get("tone") or "warm"),
             need_web=bool(inputs.get("need_web") or False),
+
+            primary_brain_key=inputs.get("primary_brain_key") or None,
+            secondary_brain_key=inputs.get("secondary_brain_key") or None,
+            secondary_brain_reason=inputs.get("secondary_brain_reason"),
+            resume_loop_id=inputs.get("resume_loop_id"),
+            keep_warm_topic=bool(inputs.get("keep_warm_topic", False)),
+            task_execution_context=inputs.get("task_execution_context") or {},
+
             route_source=str(inputs.get("route_source") or "orchestrator"),
             runtime_state=str(inputs.get("state") or inputs.get("runtime_state") or ""),
+
             docs_chunks=docs_chunks or {},
             playbook=playbook or {},
+
             smalltalk_target_key=inputs.get("smalltalk_target_key"),
             intent_eligible=bool(inputs.get("intent_eligible", True)),
             intent_block_reason=inputs.get("intent_block_reason"),
@@ -267,6 +278,7 @@ class PlanExecutor:
             transition_reason=inputs.get("transition_reason"),
             soft_paywall_warning=bool(inputs.get("soft_paywall_warning", False)) or should_soft_warn,
             trial_feedback_prompt_enabled=bool(inputs.get("trial_feedback_prompt_enabled", False)),
+
             context=ctx or {},
             quota=quota or {},
             web=web or {},
@@ -984,6 +996,14 @@ class PlanExecutor:
                 language=str(inputs.get("language") or "fr"),
                 tone=str(inputs.get("tone") or "warm"),
                 need_web=bool(inputs.get("need_web") or False),
+
+                primary_brain_key=inputs.get("primary_brain_key") or None,
+                secondary_brain_key=inputs.get("secondary_brain_key") or None,
+                secondary_brain_reason=inputs.get("secondary_brain_reason"),
+                resume_loop_id=inputs.get("resume_loop_id"),
+                keep_warm_topic=bool(inputs.get("keep_warm_topic", False)),
+                task_execution_context=inputs.get("task_execution_context") or {},
+
                 route_source=str(inputs.get("route_source") or "orchestrator"),
                 runtime_state=str(inputs.get("state") or inputs.get("runtime_state") or ""),
 
@@ -1047,6 +1067,19 @@ class PlanExecutor:
                 has_docs=bool(docs_chunks and isinstance(docs_chunks, dict) and docs_chunks.get("chunks")),
                 trial_feedback_prompt_enabled=bool(rw_inputs.get("trial_feedback_prompt_enabled", False)),
                 has_playbook=bool(playbook and playbook.get("ok")),
+            )
+
+            chat_logger.info(
+                "chat.response_writer.call.task_context",
+                conversation_id=str(self.conversation_id),
+                public_user_id=str(self.public_user_id),
+                node_id=str(node.get("id") or "D"),
+                has_task_execution_context=bool(rw_inputs.get("task_execution_context")),
+                task_execution_context=_preview(rw_inputs.get("task_execution_context")) if DEBUG_PIPELINE else rw_inputs.get("task_execution_context"),
+                primary_brain_key=str(rw_inputs.get("primary_brain_key") or ""),
+                secondary_brain_key=str(rw_inputs.get("secondary_brain_key") or ""),
+                resume_loop_id=str(rw_inputs.get("resume_loop_id") or ""),
+                keep_warm_topic=bool(rw_inputs.get("keep_warm_topic", False)),
             )
 
             res = await self.response_writer.run(**rw_inputs)

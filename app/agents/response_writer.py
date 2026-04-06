@@ -256,6 +256,55 @@ def _domain_from_url(url: str) -> str:
     except Exception:
         return ""
 
+def _normalize_key(x: Any) -> str:
+    return _safe_str(x).strip()
+
+def _load_prompt_block_safe(*, kind: str, key: str, vars: Optional[Dict[str, str]] = None) -> str:
+    key = _normalize_key(key)
+    if not key:
+        return ""
+    try:
+        return load_user_prompt_block(kind=kind, key=key, vars=vars or {}).strip()
+    except Exception:
+        return ""
+
+def _resolve_brain_block(
+    *,
+    brain_key: str,
+    vars: Optional[Dict[str, str]] = None,
+    prefer_light_variant: bool = False,
+) -> Dict[str, str]:
+    """
+    Résout un brain vers un vrai block injecté.
+    Priorité :
+    1. misc exact
+    2. misc <key>_light si prefer_light_variant=true
+    3. intent exact
+    4. vide
+    """
+    key = _normalize_key(brain_key)
+    if not key:
+        return {"resolved_key": "", "resolved_kind": "", "content": ""}
+
+    misc_keys = set(get_user_prompt_keys("misc"))
+    intent_keys = set(get_user_prompt_keys("intent"))
+
+    if key in misc_keys:
+        content = _load_prompt_block_safe(kind="misc", key=key, vars=vars)
+        return {"resolved_key": key, "resolved_kind": "misc", "content": content}
+
+    if prefer_light_variant:
+        light_key = f"{key}_light"
+        if light_key in misc_keys:
+            content = _load_prompt_block_safe(kind="misc", key=light_key, vars=vars)
+            return {"resolved_key": light_key, "resolved_kind": "misc", "content": content}
+
+    if key in intent_keys:
+        content = _load_prompt_block_safe(kind="intent", key=key, vars=vars)
+        return {"resolved_key": key, "resolved_kind": "intent", "content": content}
+
+    return {"resolved_key": "", "resolved_kind": "", "content": ""}
+
 
 class ResponseWriterAgent:
     """
@@ -285,10 +334,16 @@ class ResponseWriterAgent:
         user_message: str,
         raw_user_message: Optional[str] = None,
         intent: str,
+        primary_brain_key: Optional[str] = None,
+        secondary_brain_key: Optional[str] = None,
+        secondary_brain_reason: Optional[str] = None,
+        resume_loop_id: Optional[str] = None,
+        keep_warm_topic: bool = False,
         language: str = "fr",
         tone: str = "warm",
         need_web: bool = False,
         mode: str = "normal",
+        task_execution_context: Optional[Dict[str, Any]] = None,
         smalltalk_target_key: Optional[str] = None,
         transition_window: bool = False,
         transition_reason: Optional[str] = None,
@@ -335,13 +390,29 @@ class ResponseWriterAgent:
         use_tu_form = True if use_tu_raw is True else False if use_tu_raw is False else False
         use_tu_known = (use_tu_raw is True) or (use_tu_raw is False)
 
-        preferred_name = _safe_str(
-            preferences.get("preferred_name")
-            or settings_ctx.get("preferred_name")
+        preferred_name_raw = _safe_str(
+            preferences.get("preferred_name") or ""
+        ).strip()
+
+        address_name = _safe_str(
+            preferences.get("address_name")
+            or preferred_name_raw
+            or user_ctx.get("first_name")
             or ""
         ).strip()
 
-        user_name = preferred_name or _safe_str(user_ctx.get("first_name") or "").strip() or "null"
+        chat_logger.info(
+            "chat.response_writer.addressing",
+            use_tu_raw=use_tu_raw,
+            use_tu_form=use_tu_form,
+            use_tu_known=use_tu_known,
+            preferred_name_raw=preferred_name_raw or None,
+            address_name=address_name or None,
+            member_job_role=_safe_str(member_ctx.get("job_role") or ""),
+            member_role=_safe_str(member_ctx.get("role") or ""),
+            user_first_name=_safe_str(user_ctx.get("first_name") or "") or None,
+            user_last_name=_safe_str(user_ctx.get("last_name") or "") or None,
+        )
 
         discovery_status = _safe_str(
             onboarding_state.get("discovery_status")
@@ -412,9 +483,107 @@ class ResponseWriterAgent:
             docs_snippets.append(f"- {txt}")
 
         docs_block = "\n".join(docs_snippets) if docs_snippets else "(none)"
+        tec = task_execution_context if isinstance(task_execution_context, dict) else {}
+
+        task_detected = bool(tec.get("task_detected") is True)
+        task_key = _safe_str(tec.get("task_key") or "").strip()
+        task_label = _safe_str(tec.get("task_label") or "").strip()
+        task_status = _safe_str(tec.get("task_status") or "unknown").strip().lower()
+        task_category = _safe_str(tec.get("task_category") or "").strip()
+        required_integrations = tec.get("required_integrations") or []
+        connected_integrations = tec.get("connected_integrations") or []
+        missing_integrations = tec.get("missing_integrations") or []
+        can_execute_now = bool(tec.get("can_execute_now") is True)
+
+        if not isinstance(required_integrations, list):
+            required_integrations = []
+        if not isinstance(connected_integrations, list):
+            connected_integrations = []
+        if not isinstance(missing_integrations, list):
+            missing_integrations = []
+
+        task_execution_block = ""
+        if intent == "task_execution":
+            task_execution_block = f"""
+BLOC TÂCHE À LA VOLÉE — CADRE STRICT
+
+Contexte de résolution de tâche :
+- task_detected: {task_detected}
+- task_key: {task_key or "null"}
+- task_label: {task_label or "null"}
+- task_status: {task_status or "unknown"}
+- task_category: {task_category or "null"}
+- required_integrations: {required_integrations}
+- connected_integrations: {connected_integrations}
+- missing_integrations: {missing_integrations}
+- can_execute_now: {can_execute_now}
+
+RÈGLE ABSOLUE
+Tu ne prétends jamais pouvoir faire une tâche si ce bloc ne te dit pas explicitement qu’elle est exécutable maintenant.
+
+CAS 1 — tâche active et exécutable maintenant
+Condition :
+- task_detected = true
+- task_status = "active"
+- can_execute_now = true
+
+Comportement :
+- tu confirmes clairement que tu peux t’en charger ;
+- tu reformules brièvement l’action ;
+- tu restes sobre, directe, professionnelle ;
+- tu ne racontes pas la cuisine interne ;
+- tu termines obligatoirement par la ligne exacte :
+task_to_execute=true
+
+CAS 2 — tâche active mais intégration manquante
+Condition :
+- task_detected = true
+- task_status = "active"
+- can_execute_now = false
+- missing_integrations non vide
+
+Comportement :
+- tu expliques que l’action est bien prévue mais qu’elle dépend d’une ou plusieurs connexions manquantes ;
+- tu cites explicitement les intégrations manquantes si elles sont présentes ;
+- tu expliques que dès que la connexion est faite, tu pourras gérer cette tâche ;
+- tu n’ajoutes aucun token de fin.
+
+CAS 3 — tâche prévue mais pas encore activée
+Condition :
+- task_detected = true
+- task_status = "disabled"
+
+Comportement :
+- tu expliques clairement que cette capacité est prévue mais pas encore disponible ;
+- tu ne fais aucune promesse de disponibilité immédiate ;
+- tu restes concise ;
+- tu n’ajoutes aucun token de fin.
+
+CAS 4 — besoin non reconnu / non prévu
+Condition :
+- task_detected = false
+ou task_status = "unknown"
+
+Comportement :
+- tu expliques clairement que tu ne peux pas encore faire cela directement ;
+- tu cadres le besoin de façon utile et professionnelle ;
+- tu évites le flou ;
+- tu peux inviter le user à préciser en une phrase ce qu’il veut exactement obtenir ;
+- tu termines obligatoirement par la ligne exacte :
+custom_request=true
+
+STYLE
+- clair
+- direct
+- professionnel
+- sans jargon inutile
+- sans survendre
+- sans dire “je vais essayer” si tu n’as pas la capacité confirmée
+""".strip()
 
         state_keys = get_user_prompt_keys("state")
         intent_keys = get_user_prompt_keys("intent")
+        misc_keys = get_user_prompt_keys("misc")
 
         if state_key and state_key not in state_keys:
             state_key = ""
@@ -444,12 +613,72 @@ class ResponseWriterAgent:
         if state_key:
             state_block = load_user_prompt_block(kind="state", key=state_key, vars=state_vars).strip()
 
-        intent_block = ""
-        if intent_key:
-            intent_block = load_user_prompt_block(kind="intent", key=intent_key, vars=intent_vars).strip()
+        primary_brain_candidate = _normalize_key(primary_brain_key or intent_key)
+        secondary_brain_candidate = _normalize_key(secondary_brain_key)
+
+        primary_brain_resolved = _resolve_brain_block(
+            brain_key=primary_brain_candidate,
+            vars=intent_vars,
+            prefer_light_variant=False,
+        )
+
+        primary_brain_block = primary_brain_resolved["content"]
+        primary_brain_resolved_key = primary_brain_resolved["resolved_key"]
+        primary_brain_resolved_kind = primary_brain_resolved["resolved_kind"]
+
+        secondary_brain_block = ""
+        secondary_brain_resolved_key = ""
+        secondary_brain_resolved_kind = ""
+
+        state_already_covers_secondary = bool(
+            state_key
+            and secondary_brain_candidate
+            and (
+                secondary_brain_candidate == state_key
+                or secondary_brain_candidate == f"{state_key}_light"
+            )
+        )
+
+        if (
+            secondary_brain_candidate
+            and not state_already_covers_secondary
+            and secondary_brain_candidate != primary_brain_candidate
+            and secondary_brain_candidate != primary_brain_resolved_key
+        ):
+            secondary_resolved = _resolve_brain_block(
+                brain_key=secondary_brain_candidate,
+                vars=intent_vars,
+                prefer_light_variant=True,
+            )
+
+            secondary_brain_block = secondary_resolved["content"]
+            secondary_brain_resolved_key = secondary_resolved["resolved_key"]
+            secondary_brain_resolved_kind = secondary_resolved["resolved_kind"]
+
+        secondary_brain_wrapper = ""
+        if secondary_brain_block:
+            secondary_brain_wrapper = f"""
+BLOC SECONDAIRE — MÉMOIRE ACTIVE
+- secondary_brain_key: {secondary_brain_resolved_key or secondary_brain_candidate or "null"}
+- secondary_brain_reason: {_safe_str(secondary_brain_reason or "null")}
+- resume_loop_id: {_safe_str(resume_loop_id or "null")}
+- keep_warm_topic: {"true" if keep_warm_topic else "false"}
+
+RÈGLES D’USAGE
+- Ce bloc est secondaire.
+- Tu réponds toujours d’abord au sujet principal.
+- Tu n’ouvres ce sujet secondaire que si une fenêtre naturelle existe.
+- Tu ne forces jamais la reprise du sujet secondaire.
+- Tu t’en sers comme mémoire active légère.
+""".strip()
 
         trial_feedback_block = ""
-        if trial_feedback_prompt_enabled:
+        trial_already_covered_by_brain = (
+            (primary_brain_resolved_key in {"trial_feedback", "trial_feedback_light"})
+            or (secondary_brain_resolved_key in {"trial_feedback", "trial_feedback_light"})
+        )
+
+        if trial_feedback_prompt_enabled and not trial_already_covered_by_brain:
             trial_feedback_block = TRIAL_FEEDBACK_BLOCK
 
         raw_msg = (raw_user_message or user_message or "").strip()
@@ -596,7 +825,7 @@ PARAMÈTRES
 - tone: {tone}
 - tutoiement: {use_tu_form}
 - tutoiement_known: {use_tu_known}
-- user_name: {user_name}
+- address_name: {address_name or "null"}
 
 CONTEXTE MÉTIER COURT
 - cabinet_name: {_safe_str(cabinet_ctx.get("name") or "cabinet")}
@@ -633,7 +862,13 @@ INSTRUCTIONS DE RÉPONSE
 
 {state_block}
 
-{intent_block}
+{primary_brain_block}
+
+{secondary_brain_wrapper}
+
+{secondary_brain_block}
+
+{task_execution_block}
 
 {trial_feedback_block}
 
@@ -641,13 +876,33 @@ INSTRUCTIONS DE RÉPONSE
 
         p = load_lisa_system_prompts()
 
+        if intent == "task_execution":
+            chat_logger.info(
+                "chat.response_writer.task_execution_context",
+                task_detected=task_detected,
+                task_key=task_key or None,
+                task_label=task_label or None,
+                task_status=task_status or "unknown",
+                task_category=task_category or None,
+                required_integrations=required_integrations,
+                connected_integrations=connected_integrations,
+                missing_integrations=missing_integrations,
+                can_execute_now=can_execute_now,
+            )
+
         chat_logger.info(
             "chat.response_writer.prompt_parts",
             system_base_len=len(SYSTEM_RESPONSE_WRITER_PROMPT.strip()),
             signature_len=len(p.get("signature", "")),
             format_len=len(p.get("format", "")),
             state_block_len=len(state_block or ""),
-            intent_block_len=len(intent_block or ""),
+            primary_brain_block_len=len(primary_brain_block or ""),
+            secondary_brain_block_len=len(secondary_brain_block or ""),
+            secondary_brain_enabled=bool(secondary_brain_block),
+            primary_brain_key=primary_brain_resolved_key or primary_brain_candidate or "null",
+            primary_brain_kind=primary_brain_resolved_kind or "null",
+            secondary_brain_key=secondary_brain_resolved_key or secondary_brain_candidate or "null",
+            secondary_brain_kind=secondary_brain_resolved_kind or "null",
             fastpath_directive_len=len(fastpath_directive_block or ""),
             fastpath_directive_enabled=bool(fastpath_directive_block),
             trial_feedback_block_len=len(trial_feedback_block or ""),
@@ -693,6 +948,13 @@ INSTRUCTIONS DE RÉPONSE
             "is_fastpath": is_fastpath,
             "runtime_state": runtime_state_in,
             "discovery_status": discovery_status,
+            "primary_brain_key": primary_brain_resolved_key or primary_brain_candidate,
+            "primary_brain_kind": primary_brain_resolved_kind,
+            "secondary_brain_key": secondary_brain_resolved_key or secondary_brain_candidate,
+            "secondary_brain_kind": secondary_brain_resolved_kind,
+            "secondary_brain_reason": secondary_brain_reason,
+            "resume_loop_id": resume_loop_id,
+            "keep_warm_topic": keep_warm_topic,
         }
 
         return {
@@ -717,10 +979,16 @@ INSTRUCTIONS DE RÉPONSE
         user_message: str,
         raw_user_message: Optional[str] = None,
         intent: str,
+        primary_brain_key: Optional[str] = None,
+        secondary_brain_key: Optional[str] = None,
+        secondary_brain_reason: Optional[str] = None,
+        resume_loop_id: Optional[str] = None,
+        keep_warm_topic: bool = False,
         language: str = "fr",
         tone: str = "warm",
         need_web: bool = False,
         mode: str = "normal",
+        task_execution_context: Optional[Dict[str, Any]] = None,
         smalltalk_target_key: Optional[str] = None,
         transition_window: bool = False,
         transition_reason: Optional[str] = None,
@@ -743,10 +1011,16 @@ INSTRUCTIONS DE RÉPONSE
             user_message=user_message,
             raw_user_message=raw_user_message,
             intent=intent,
+            primary_brain_key=primary_brain_key,
+            secondary_brain_key=secondary_brain_key,
+            secondary_brain_reason=secondary_brain_reason,
+            resume_loop_id=resume_loop_id,
+            keep_warm_topic=keep_warm_topic,
             language=language,
             tone=tone,
             need_web=need_web,
             mode=mode,
+            task_execution_context=task_execution_context,
             smalltalk_target_key=smalltalk_target_key,
             transition_window=transition_window,
             transition_reason=transition_reason,
@@ -898,10 +1172,16 @@ INSTRUCTIONS DE RÉPONSE
         user_message: str,
         raw_user_message: Optional[str] = None,
         intent: str,
+        primary_brain_key: Optional[str] = None,
+        secondary_brain_key: Optional[str] = None,
+        secondary_brain_reason: Optional[str] = None,
+        resume_loop_id: Optional[str] = None,
+        keep_warm_topic: bool = False,
         language: str = "fr",
         tone: str = "warm",
         need_web: bool = False,
         mode: str = "normal",
+        task_execution_context: Optional[Dict[str, Any]] = None,
         smalltalk_target_key: Optional[str] = None,
         transition_window: bool = False,
         transition_reason: Optional[str] = None,
@@ -925,10 +1205,16 @@ INSTRUCTIONS DE RÉPONSE
             user_message=user_message,
             raw_user_message=raw_user_message,
             intent=intent,
+            primary_brain_key=primary_brain_key,
+            secondary_brain_key=secondary_brain_key,
+            secondary_brain_reason=secondary_brain_reason,
+            resume_loop_id=resume_loop_id,
+            keep_warm_topic=keep_warm_topic,
             language=language,
             tone=tone,
             need_web=need_web,
             mode=mode,
+            task_execution_context=task_execution_context,
             smalltalk_target_key=smalltalk_target_key,
             transition_window=transition_window,
             transition_reason=transition_reason,

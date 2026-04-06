@@ -551,10 +551,15 @@ class LLMRuntime:
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Stream natif texte.
-        Yield des events internes:
+        Yield:
         - {"type":"start","provider":"...","model":"..."}
         - {"type":"delta","text":"..."}
         - {"type":"end","provider":"...","model":"...","duration_ms":1234}
+
+        Règle de robustesse :
+        - si un provider stream casse AVANT d'avoir émis du texte -> on peut tenter un autre provider en stream
+        - si un provider stream casse APRÈS avoir déjà émis du texte -> on ne tente PAS un autre stream
+          pour éviter d'empiler deux réponses ; on bascule en fallback non-stream côté backend
         """
         last_err: Optional[Exception] = None
 
@@ -582,9 +587,7 @@ class LLMRuntime:
         providers_to_try = list(self.providers)
         providers_to_try = [p for p in providers_to_try if p.get("name") in self.chat_provider_allowlist]
 
-        if (
-            is_fastpath_smalltalk_intro
-        ):
+        if is_fastpath_smalltalk_intro:
             preferred = ["deepseek", "openai"]
             name_to_p = {p["name"]: p for p in providers_to_try}
             ordered = [name_to_p[n] for n in preferred if n in name_to_p]
@@ -607,7 +610,9 @@ class LLMRuntime:
                 },
             )
 
-        for provider in providers_to_try:
+        emitted_to_front = False
+
+        for idx, provider in enumerate(providers_to_try):
             if not provider.get("api_key"):
                 continue
 
@@ -618,7 +623,11 @@ class LLMRuntime:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 ):
+                    if event.get("type") == "delta":
+                        emitted_to_front = True
+
                     yield event
+
                 return
 
             except Exception as e:
@@ -632,11 +641,64 @@ class LLMRuntime:
                             "model": provider.get("model"),
                             "error_type": type(e).__name__,
                             "error_preview": str(e)[:200],
+                            "emitted_to_front": emitted_to_front,
                         },
                     )
+
+                # Cas critique :
+                # on a déjà commencé à streamer une réponse => on ne tente surtout pas
+                # un autre provider en stream, sinon double réponse côté front.
+                if emitted_to_front:
+                    break
+
                 continue
 
-        raise LLMCallError(f"All LLM stream providers failed. Last error: {last_err}")
+        # Fallback final en NON-STREAM pour éviter l'empilement de réponses
+        try:
+            text, meta = await self.chat_text(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                trace=trace,
+            )
+
+            if self._trace_enabled():
+                print(
+                    "[LLM_TRACE] stream_to_nonstream_fallback",
+                    {
+                        "provider": meta.get("provider"),
+                        "model": meta.get("model"),
+                        "duration_ms": meta.get("duration_ms"),
+                        "had_partial_stream": emitted_to_front,
+                    },
+                )
+
+            # Si rien n'avait encore été émis, on envoie aussi un start synthétique
+            if not emitted_to_front:
+                yield {
+                    "type": "start",
+                    "provider": meta.get("provider"),
+                    "model": meta.get("model"),
+                }
+
+            if text:
+                yield {
+                    "type": "delta",
+                    "text": text,
+                }
+
+            yield {
+                "type": "end",
+                "provider": meta.get("provider"),
+                "model": meta.get("model"),
+                "duration_ms": meta.get("duration_ms"),
+            }
+            return
+
+        except Exception as fallback_err:
+            raise LLMCallError(
+                f"All LLM stream providers failed. Last stream error: {last_err}; fallback non-stream error: {fallback_err}"
+            )
 
     async def chat_json(
         self,

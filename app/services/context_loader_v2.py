@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List, Optional
+from app.core.chat_logger import chat_logger
 
 from asyncpg import Connection
 
@@ -45,6 +46,15 @@ def _safe_iso(dt: Any) -> Optional[str]:
     except Exception:
         return None
 
+def _is_conversation_loop_type(loop_type: Any) -> bool:
+    allowed = {
+        "pain_point",
+        "pending_question",
+        "followup_needed",
+        "onboarding_gap",
+        "proactive_checkin",
+    }
+    return str(loop_type or "").strip().lower() in allowed
 
 def _extract_preference_from_user_facts(user_facts: List[Dict[str, Any]]) -> Dict[str, Any]:
     use_tu_form = None
@@ -75,6 +85,39 @@ def _extract_preference_from_user_facts(user_facts: List[Dict[str, Any]]) -> Dic
         "preferred_name": preferred_name,
         "addressing_preference_known": (use_tu_form is True or use_tu_form is False),
     }
+
+def _derive_preferred_name(
+    *,
+    use_tu_form: Any,
+    user: Dict[str, Any],
+    member: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Calcule le nom d'appel à utiliser par Lisa.
+
+    Règle validée :
+    - si tutoiement => prénom
+    - si vouvoiement + médecin => "Dr <last_name>", sinon "Docteur"
+    - si vouvoiement + non médecin => prénom
+    """
+
+    first_name = str((user or {}).get("first_name") or "").strip()
+    last_name = str((user or {}).get("last_name") or "").strip()
+    job_role = str((member or {}).get("job_role") or "").strip().lower()
+
+    is_doctor = job_role == "medecin"
+
+    if use_tu_form is True:
+        return first_name or None
+
+    if use_tu_form is False:
+        if is_doctor:
+            if last_name:
+                return f"Dr {last_name}"
+            return "Docteur"
+        return first_name or None
+
+    return None
 
 
 async def load_context_light(
@@ -415,6 +458,84 @@ async def load_context_light(
     # 9) Preferences dérivées
     # ---------------------------------------------------
     prefs = _extract_preference_from_user_facts(user_facts)
+    derived_preferred_name = _derive_preferred_name(
+        use_tu_form=prefs["use_tu_form"],
+        user=user,
+        member=member,
+    )
+
+    # ---------------------------------------------------
+    # 10) Conversation loops actives (uniquement loops de discussion)
+    # ---------------------------------------------------
+    conversation_loops: List[Dict[str, Any]] = []
+    try:
+        loop_rows = await conn.fetch(
+            """
+            select
+              id,
+              conversation_id,
+              public_user_id,
+              loop_type,
+              status,
+              title,
+              summary,
+              priority,
+              score,
+              priority_score,
+              urgency_score,
+              origin_brain_key,
+              resume_brain_key,
+              why_now,
+              evidence,
+              metadata,
+              last_seen_at,
+              updated_at,
+              created_at
+            from public.conversation_loops
+            where public_user_id = $1::uuid
+              and conversation_id = $2::uuid
+              and status = 'open'
+            order by urgency_score desc nulls last,
+                     updated_at desc nulls last
+            limit 20
+            """,
+            public_user_id,
+            conversation_id,
+        )
+
+        for row in loop_rows:
+            r = dict(row)
+            if not _is_conversation_loop_type(r.get("loop_type")):
+                continue
+
+            conversation_loops.append(
+                {
+                    "id": str(r.get("id")) if r.get("id") else None,
+                    "conversation_id": str(r.get("conversation_id")) if r.get("conversation_id") else None,
+                    "public_user_id": str(r.get("public_user_id")) if r.get("public_user_id") else None,
+                    "loop_type": r.get("loop_type"),
+                    "status": r.get("status"),
+                    "title": r.get("title"),
+                    "summary": r.get("summary"),
+                    "priority": r.get("priority"),
+                    "score": float(r.get("score")) if r.get("score") is not None else None,
+                    "priority_score": float(r.get("priority_score")) if r.get("priority_score") is not None else None,
+                    "urgency_score": float(r.get("urgency_score")) if r.get("urgency_score") is not None else None,
+                    "origin_brain_key": r.get("origin_brain_key"),
+                    "resume_brain_key": r.get("resume_brain_key"),
+                    "why_now": r.get("why_now"),
+                    "evidence": r.get("evidence"),
+                    "metadata": r.get("metadata") if isinstance(r.get("metadata"), dict) else {},
+                    "last_seen_at": _safe_iso(r.get("last_seen_at")),
+                    "updated_at": _safe_iso(r.get("updated_at")),
+                    "created_at": _safe_iso(r.get("created_at")),
+                }
+            )
+
+        conversation_loops = conversation_loops[:5]
+
+    except Exception:
+        conversation_loops = []
 
     # ---------------------------------------------------
     # 10) Docs scopes (source de vérité = lisa_service_docs)
@@ -438,9 +559,31 @@ async def load_context_light(
     except Exception:
         docs_scopes = []
 
+
+    actions_catalog = await _load_actions_catalog(conn)
+    user_integrations = await _load_user_integrations(
+        conn,
+        cabinet_account_id=str(cabinet.get("id")) if cabinet.get("id") else None,
+    )
+
+    chat_logger.info(
+        "chat.actions_and_integrations.loaded",
+        public_user_id=str(public_user_id),
+        cabinet_account_id=str(cabinet.get("id")) if cabinet.get("id") else None,
+        actions_count=len(actions_catalog.get("actions") or []),
+        integrations_count=len(user_integrations.get("integrations") or []),
+        integrations_connected=[
+            i["integration_key"]
+            for i in user_integrations.get("integrations", [])
+            if i.get("connected")
+        ],
+    )
+
     # ---------------------------------------------------
     # 10bis) Payload core context V2
     # ---------------------------------------------------
+
+
     return {
         "conversation": {
             "id": str(conversation.get("id")) if conversation.get("id") else str(conversation_id),
@@ -466,16 +609,24 @@ async def load_context_light(
         "preferences": {
             "use_tu_form": prefs["use_tu_form"],
             "preferred_name": prefs["preferred_name"],
+            "address_name": derived_preferred_name or prefs["preferred_name"],
             "addressing_preference_known": prefs["addressing_preference_known"],
         },
         "facts": {
             "user_facts": user_facts,
             "cabinet_facts": cabinet_facts,
         },
+        "loops": {
+            "conversation_loops": conversation_loops,
+            "conversation_loops_count": len(conversation_loops),
+            "has_conversation_loops": len(conversation_loops) > 0,
+        },
         "docs": {
             "scopes_all": docs_scopes,
             "scopes_count": len(docs_scopes),
         },
+        "actions": actions_catalog,
+        "integrations": user_integrations,
         "history": {
             "messages": messages,
             "last_user_message": last_user_message,
@@ -552,6 +703,80 @@ async def _load_billing_block(
         "trial_feedback_context_closed": bool(r.get("trial_feedback_context_closed") is True),
         "created_at": _safe_iso(r.get("created_at")),
         "updated_at": _safe_iso(r.get("updated_at")),
+    }
+
+
+async def _load_actions_catalog(conn: Connection) -> Dict[str, Any]:
+    rows = await conn.fetch(
+        """
+        select
+          action_key as task_key,
+          title as label,
+          status,
+          category,
+          required_integrations
+        from public.lisa_actions_catalog
+        order by category asc, title asc
+        """
+    )
+
+    actions = []
+
+    for r in rows:
+        actions.append(
+            {
+                "task_key": str(r["task_key"] or ""),
+                "label": str(r["label"] or ""),
+                "status": str(r["status"] or "unknown"),
+                "category": str(r["category"] or ""),
+                "required_integrations": r["required_integrations"] or [],
+            }
+        )
+
+    return {
+        "version": "v1",
+        "actions": actions,
+    }
+
+
+async def _load_user_integrations(
+    conn: Connection,
+    cabinet_account_id: str | None,
+) -> Dict[str, Any]:
+
+    if not cabinet_account_id:
+        return {
+            "count": 0,
+            "integrations": [],
+        }
+
+    rows = await conn.fetch(
+        """
+        select
+          integration_key,
+          status,
+          connected_at
+        from public.lisa_user_integrations
+        where cabinet_account_id = $1::uuid
+        """,
+        cabinet_account_id,
+    )
+
+    integrations = []
+
+    for r in rows:
+        integrations.append(
+            {
+                "integration_key": str(r["integration_key"]),
+                "status": str(r["status"]),
+                "connected": str(r["status"]) == "connected",
+                "connected_at": _safe_iso(r.get("connected_at")),
+            }
+        )
+
+    return {
+        "count": len(integrations),
+        "integrations": integrations,
     }
 
 

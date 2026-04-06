@@ -73,6 +73,185 @@ npm start
 cd ~/heylisa-webapp
 npm run dev
 
+
+## SQL Reset compte test
+
+begin;
+
+-- =========================================================
+-- PARAMÈTRE
+-- =========================================================
+-- User cible
+-- Exemple :
+-- d1de7543-92c6-4b7d-b8e1-2a31169cb569
+
+-- =========================================================
+-- 1) NETTOYAGE DES MESSAGES UNIQUEMENT
+-- =========================================================
+delete from public.conversation_messages
+where conversation_id in (
+  select id
+  from public.conversations
+  where user_id = 'd1de7543-92c6-4b7d-b8e1-2a31169cb569'::uuid
+);
+
+-- =========================================================
+-- 2) SUPPRESSION MÉMOIRE UTILISATEUR
+-- =========================================================
+delete from public.user_facts
+where user_id = 'd1de7543-92c6-4b7d-b8e1-2a31169cb569'::uuid;
+
+delete from public.userfacts_daily_queue
+where public_user_id = 'd1de7543-92c6-4b7d-b8e1-2a31169cb569'::uuid;
+
+-- =========================================================
+-- 3) SUPPRESSION LOOPS / PROACTIVITÉ
+-- =========================================================
+delete from public.conversation_loops
+where public_user_id = 'd1de7543-92c6-4b7d-b8e1-2a31169cb569'::uuid;
+
+-- =========================================================
+-- 4) RESET SETTINGS USER
+-- =========================================================
+update public.user_settings
+set
+  use_tu_form = null,
+  updated_at = now()
+where user_id = 'd1de7543-92c6-4b7d-b8e1-2a31169cb569'::uuid;
+
+-- =========================================================
+-- 5) RESET ONBOARDING / DISCOVERY
+-- =========================================================
+update public.user_onboarding_state
+set
+  discovery_status = 'to_do',
+  discovery_completed_at = null,
+  intro_smalltalk_turns = 0,
+  updated_at = now()
+where user_id = 'd1de7543-92c6-4b7d-b8e1-2a31169cb569'::uuid;
+
+insert into public.user_onboarding_state (
+  user_id,
+  discovery_status,
+  discovery_completed_at,
+  intro_smalltalk_turns,
+  created_at,
+  updated_at
+)
+select
+  'd1de7543-92c6-4b7d-b8e1-2a31169cb569'::uuid,
+  'to_do',
+  null,
+  0,
+  now(),
+  now()
+where not exists (
+  select 1
+  from public.user_onboarding_state
+  where user_id = 'd1de7543-92c6-4b7d-b8e1-2a31169cb569'::uuid
+);
+
+-- =========================================================
+-- 6) RESET CONTEXTE TRIAL FEEDBACK
+-- =========================================================
+update public.user_billing_status
+set
+  trial_feedback_context_active = false,
+  trial_feedback_context_closed = false,
+  updated_at = now()
+where public_user_id = 'd1de7543-92c6-4b7d-b8e1-2a31169cb569'::uuid;
+
+-- =========================================================
+-- 7) RESET FACTS CABINET (OPTIONNEL)
+-- =========================================================
+delete from public.cabinet_facts
+where cabinet_account_id = (
+  select primary_company_id
+  from public.users
+  where id = 'd1de7543-92c6-4b7d-b8e1-2a31169cb569'::uuid
+);
+
+commit;
+
+
+
+
+
+
+
+
+
+
+
+Proposition de roadmap immédiate
+
+Je te conseille de faire ça dans cet ordre :
+
+Étape 1
+
+Faire évoluer la sortie orchestrator :
+	•	primary_intent
+	•	primary_brain_key
+	•	secondary_brain_key
+	•	secondary_brain_reason
+	•	resume_loop_id
+	•	keep_warm_topic
+
+Étape 2
+
+Patch _build_plan_minimal() pour envoyer au RW :
+	•	primary_intent
+	•	primary_brain_key
+	•	secondary_brain_key
+	•	secondary_brain_reason
+
+Étape 3
+
+Adapter le RW pour :
+	•	charger le bloc principal
+	•	charger un bloc secondaire plus léger
+	•	ne pas forcer son ouverture
+	•	mais pouvoir rebondir dessus
+
+Étape 4
+
+Créer une loop trial_feedback quand Lisa ouvre réellement le sujet d’essai
+	•	comme ça le sujet ne dépend plus seulement du flag billing/context
+
+Étape 5
+
+Règle onboarding :
+si followup proactif sur onboarding_gap aboutit à une vraie reprise couverte → complete
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ## ⚙️ Setup local
 
 ### 1) Environnement Python

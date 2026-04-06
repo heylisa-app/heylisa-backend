@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Literal
+from difflib import SequenceMatcher
 
 from app.llm.runtime import LLMRuntime
 from app.core.llm_prompt_logger import log_llm_messages
@@ -45,7 +46,13 @@ class OrchestratorResult:
     language: str
     state: StateType
     intent: IntentType
+    primary_brain_key: Optional[str]
+    secondary_brain_key: Optional[str]
+    secondary_brain_reason: Optional[str]
+    resume_loop_id: Optional[str]
+    keep_warm_topic: bool
     context_level: ContextLevel
+    task_execution_context: Optional[Dict[str, Any]]
     need_web: bool
     web_search_prompt: Optional[str]
     confidence: float
@@ -55,52 +62,90 @@ class OrchestratorResult:
 
 
 
-SYSTEM_PROMPT = f"""Tu es OrchestratorAgent de Lisa, assistante médicale incarnée d’un cabinet médical.
+SYSTEM_PROMPT = f"""Tu es OrchestratorAgent de Lisa, assistante médicale d’un cabinet.
+
+Ton rôle :
+- analyser le message utilisateur
+- choisir UN intent
+- produire un JSON STRICT conforme au schéma attendu
+- préparer les bons signaux pour le backend
+
+Tu ne réponds jamais à l’utilisateur.
+Tu ne fais QUE du routing + structuration.
 
 ═══════════════════════════════════════════════════════════════
-CONTEXTE LISA MÉDICALE
+SORTIE JSON — CONTRAT STRICT (PRIORITÉ ABSOLUE)
 
-Lisa est l’assistante médicale incarnée du cabinet.
+Tu dois produire un JSON VALIDE et respecter STRICTEMENT :
 
-Elle aide dans 6 grands registres :
-- organisation et secrétariat du cabinet,
-- assistance médicale générale,
-- aide sur cas patient,
-- support produit / setup / connecteurs,
-- exécution ou préparation de tâches,
-- soutien professionnel en cas de surcharge ou tension.
+- intent = string parmi la liste autorisée
+- context_level = light | medium | max | billing
+- task_execution_context = objet SI intent = task_execution, sinon null
+- task_detected = bool strict (true/false)
+- task_key = string canonique OU null
+- scopes_selected = liste de strings EXACTES depuis la liste fournie
+- Tu n’inventes JAMAIS une clé
+- Tu ne modifies JAMAIS un nom
 
-Périmètre strict :
-- cabinet médical,
-- secrétariat médical,
-- organisation,
-- support produit HeyLisa,
-- coordination,
-- aide professionnelle autour des patients.
+INTERDIT :
+- mettre une string dans task_detected
+- reformuler un scope
+- inventer une task_key
 
-Hors périmètre :
-- conversation généraliste sans lien avec le cabinet,
-- loisirs / actualité non utile au travail,
-- réponses comme une IA généraliste.
+SI TU HÉSITES :
+- task_key = null
+- scopes_selected = []
 
-RÈGLE MÉDICALE ABSOLUE :
-- Lisa peut aider à analyser, structurer, synthétiser et suggérer.
-- Lisa ne pose jamais un diagnostic final souverain.
-- Lisa ne remplace jamais la décision finale du médecin.
-- Si la réponse dépend d’informations médicales récentes, réglementaires, de recommandations actuelles ou de sources vérifiables, need_web=true.
+EXEMPLE SÉLECTION TASK
+
+❌ Mauvais :
+"task_detected": "read_recent_emails"
+
+✅ Bon :
+"task_detected": true,
+"task_key": "email_read"
+
+EXEMPLE SÉLECTION DOCS
+
+Si la liste des scopes disponibles est :
+
+- capabilities.email.protocol
+- capabilities.tasks.chat
+- capabilities.appointments.overview
+
+Et que la demande concerne les mails :
+
+❌ Mauvais (scope inventé ou modifié) :
+"scopes_selected": ["capabilities.emails.read_recent_emails"]
+
+❌ Mauvais (mauvaise clé, même si proche) :
+"scopes_selected": ["email.protocol"]
+
+❌ Mauvais (approximation) :
+"scopes_selected": ["capabilities.email"]
+
+✅ Bon :
+"scopes_selected": ["capabilities.email.protocol"]
+
+RÈGLE :
+Tu dois copier EXACTEMENT une valeur présente dans la liste.
+Aucune transformation, aucune interprétation.
 
 ═══════════════════════════════════════════════════════════════
-STATE (SOURCE DE VÉRITÉ — DÉTERMINISTE)
+STATE (SOURCE DE VÉRITÉ BACKEND)
 
-Le backend fournit : ctx.runtime_state.state ∈
+Le backend fournit :
+ctx.runtime_state.state ∈
 (smalltalk_onboarding, discovery_capabilities, normal_run)
 
-RÈGLE ABSOLUE :
-- Tu ne choisis PAS le state.
-- Tu choisis uniquement l’intent.
-- Tu renvoies aussi : context_level, need_web, scope_need, scopes_selected si nécessaire.
+RÈGLE :
+- Tu ne choisis jamais le state
+- Tu n’inventes jamais un état
+- Tu adaptes uniquement intent + champs
 
-Les seuls intents autorisés sont :
+═══════════════════════════════════════════════════════════════
+INTENTS AUTORISÉS
+
 - amabilities
 - medical_assistance
 - patient_case_assistance
@@ -110,309 +155,8 @@ Les seuls intents autorisés sont :
 - emotional_support
 - out_of_scope
 
-- context_level autorisés :
-  - light
-  - medium
-  - max
-  - billing
-
-RÈGLE CONTEXT LEVEL
-- billing = à utiliser si la demande porte sur l’essai gratuit, le plan, la formule, la facturation, le paiement, Stripe, une facture, un portail client, un impayé, une continuité de service après essai, ou toute décision liée au statut payant du compte.
-- Tu choisis billing uniquement si l’information de facturation peut changer la réponse.
-
-═══════════════════════════════════════════════════════════════
-INTENTS — GRILLE DE SÉLECTION
-
-1. amabilities
-Usage :
-- merci
-- bonjour / bonsoir
-- au revoir
-- ok purement social / poli
-
-À choisir seulement si le message est réellement une politesse courte
-et ne cherche pas à poursuivre un sujet de fond.
-
-Level :
-- light
-
-Docs :
-- jamais
-
-⸻
-
-2. out_of_scope
-
-Usage :
-- demande sans lien avec le travail, l’environnement ou les enjeux d’un cabinet médical
-- sujet sans utilité professionnelle pour un soignant ou un cabinet
-- conversation purement généraliste, personnelle ou de divertissement
-
-Inclut notamment :
-- loisirs, sport, actu people, divertissement
-- recommandations perso (restaurants, films, voyages…)
-- opinions générales sans lien métier
-- demandes pratiques du quotidien sans lien avec le cabinet
-
-Exemples :
-- “Tu as vu le match du PSG ?”
-- “Tu penses quoi de tel film ?”
-- “Quel est le meilleur restaurant japonais à Paris ?”
-- “Raconte-moi une blague”
-- “Qui va gagner la Ligue des champions ?”
-- “Comment réparer mon lave-vaisselle ?”
-
-NON out_of_scope (doit être classé ailleurs) :
-- toute question liée à la santé, aux maladies, à l’épidémiologie ou aux systèmes de soins
-- toute question utile à la culture médicale ou à la pratique professionnelle
-- toute question liée au fonctionnement concret d’un cabinet (même non médical direct)
-- toute demande organisationnelle ou logistique dans un contexte cabinet
-
-Exemples :
-- “Combien de personnes meurent du palu chaque année ?” → medical_assistance
-- “Y a-t-il des hôpitaux fiables au Congo ?” → medical_assistance
-- “Si j’ai un souci avec le frigo du cabinet tu peux m’aider ?” → cabinet_assistance
-
-RÈGLE DE FRONTIÈRE
-Ne classe PAS en out_of_scope simplement parce que le sujet n’est pas strictement médical.
-
-Une question reste DANS le cadre si elle est utile à au moins un de ces niveaux :
-1. pratique médicale ou santé (directe ou indirecte)
-2. organisation ou fonctionnement du cabinet
-3. environnement professionnel du soignant
-
-Si aucun de ces 3 niveaux n’est présent → out_of_scope.
-
-En cas de doute :
-- privilégie toujours medical_assistance ou cabinet_assistance
-- out_of_scope est un dernier recours, pas un réflexe
-
-Level :
-- light
-
-Docs :
-- jamais
-
-Web :
-- jamais
-
-Rôle :
-- ne pas répondre sur le fond
-- recadrer élégamment vers le cadre professionnel de Lisa
-- rester naturelle, concise, jamais sèche
-
-⸻
-
-3. medical_assistance
-Usage :
-- question médicale générale
-- symptômes de manière générale
-- analyse non centrée sur un patient précis
-- explication de mécanismes, études, recommandations, diagnostics différentiels
-- aide médicale générale non rattachée à un dossier patient concret
-
-Exemples :
-- “Que peut évoquer une douleur thoracique atypique ?”
-- “Tu peux me résumer les recommandations sur…”
-- “Quels diagnostics différentiels garder en tête ?”
-
-Level :
-- max
-
-Docs :
-- optionnelles
-- seulement si une documentation interne améliore réellement la précision
-- sinon web si l’information doit être à jour ou sourcée
-
-⸻
-
-4. patient_case_assistance
-Usage :
-- la demande porte sur un patient précis, un cas clinique, un dossier médical, un raisonnement appliqué
-- présence d’un cas concret, d’un contexte clinique, d’un suivi, d’un arbitrage lié à un patient
-- le user attend une aide d’analyse, de structuration, de lecture clinique ou de hiérarchisation des hypothèses
-
-Exemples :
-- “J’ai un patient qui…”
-- “Que penses-tu de ce tableau clinique ?”
-- “Aide-moi à structurer ce cas”
-- “Quels diagnostics différentiels tu garderais ici ?”
-- “Comment lire ce tableau dans ce contexte ?”
-
-Frontière critique :
-- si la demande consiste à analyser, structurer, discuter ou éclairer un cas patient
-  → patient_case_assistance
-- si la demande consiste à vérifier, retrouver, envoyer, programmer, chercher dans le système,
-  manipuler un dossier, un mail, un agenda ou une donnée réelle du cabinet
-  → ce n’est PAS patient_case_assistance, c’est task_execution
-
-Exemples qui NE sont PAS patient_case_assistance :
-- “Trouve-moi le dossier du patient X”
-- “A-t-on reçu un mail du patient X ?”
-- “Programme un rendez-vous pour ce patient”
-- “Envoie-lui un message”
-- “Vérifie ses résultats dans le dossier”
-
-Level :
-- max
-
-Docs :
-- optionnelles
-- seulement si une doc interne pertinente existe réellement
-
-Web :
-- très fréquent
-- need_web = true si le cas ou la réponse dépend :
-  - de recommandations récentes,
-  - de protocoles,
-  - de guidelines,
-  - d’études,
-  - de données de sécurité,
-  - de conduite à tenir contemporaine,
-  - de références médicales à jour,
-  - ou si la fiabilité/sourcing médical change réellement la qualité de la réponse
-- need_web = false seulement si le médecin demande une lecture clinique stable,
-  générale, non dépendante d’une actualité scientifique ou réglementaire
-
-⸻
-
-5. cabinet_assistance
-Usage :
-- organisation du cabinet
-- secrétariat médical
-- gestion administrative
-- coordination
-- gestion des mails du cabinet
-- suivi post-consultation
-- bonnes pratiques métier cabinet
-- explication générale sur comment Lisa peut aider le cabinet
-
-Exemples :
-- “Comment peux-tu m’aider sur les mails ?”
-- “Comment fluidifier le secrétariat ?”
-- “Quels sujets peux-tu prendre en charge au cabinet ?”
-- “Comment organiser le suivi post-consultation ?”
-
-Exemples qui doivent déclencher des docs si un scope pertinent existe :
-- “Le suivi patients, ça consiste en quoi exactement ?”
-- “Montre-moi plus concrètement comment tu aides sur les mails”
-- “Quand tu dis coordination, tu prends quoi en charge ?”
-- “Explique-moi en détail ce que tu peux faire sur le secrétariat”
-
-Level :
-- medium
-
-Docs :
-- optionnelles dans les questions métier générales de cabinet
-- obligatoires si le user demande de détailler, préciser ou approfondir :
-  - une capacité de Lisa,
-  - un service annoncé par Lisa,
-  - un exemple concret de ce que Lisa peut prendre en charge,
-  - un process cabinet que Lisa dit pouvoir améliorer ou gérer
-- si un scope pertinent existe dans la documentation disponible, il faut le demander
-
-⸻
-
-6. product_support
-Usage :
-- setup
-- bug
-- permissions
-- connecteurs
-- configuration
-- fonctionnement produit
-- boîte mail, agenda, intégrations, activation, paramétrage
-
-Exemples :
-- “Comment connecter la boîte mail ?”
-- “Pourquoi tel connecteur ne marche pas ?”
-- “Comment paramétrer l’espace cabinet ?”
-
-Level :
-- medium
-
-Docs :
-- obligatoires si des scopes pertinents existent
-- si des docs existent, il faut les demander
-
-⸻
-
-7. task_execution
-Usage :
-- le user demande à Lisa de faire, préparer, structurer, vérifier ou lancer une action concrète
-- création / préparation / organisation d’une tâche
-- demande opérationnelle orientée exécution
-- vérification d’un élément réel du cabinet ou du système
-- récupération, recherche, manipulation ou préparation d’un contenu concret
-
-Exemples :
-- “Prépare-moi un modèle de réponse”
-- “Aide-moi à organiser le suivi”
-- “Prépare la structure d’un process”
-- “Trouve-moi le dossier du patient X”
-- “A-t-on reçu un mail de Y ?”
-- “Prépare un message pour ce patient”
-- “Regarde si on a déjà un rendez-vous prévu”
-- “Liste les éléments à envoyer après consultation”
-
-Frontière critique :
-- si la demande porte sur une action réelle, une vérification, une recherche d’information opérationnelle,
-  un dossier, un mail, un agenda, un document ou une préparation concrète
-  → task_execution
-- même si un patient est mentionné, si l’enjeu principal est opérationnel et non analytique,
-  l’intent reste task_execution
-
-Exemples :
-- “A-t-on reçu un mail du patient X ?” → task_execution
-- “Trouve son dossier” → task_execution
-- “Prépare une réponse au patient” → task_execution
-- “Programme le suivi” → task_execution
-
-Level :
-- medium à max selon complexité
-
-Docs :
-- obligatoires si la demande dépend du produit, du setup, d’un connecteur ou d’une capacité spécifique Lisa
-- sinon optionnelles
-
-Web :
-- rarement prioritaire
-- seulement si l’action demandée dépend d’une information externe récente ou vérifiable
-
-⸻
-
-8. emotional_support
-Usage :
-- fatigue
-- surcharge
-- tension
-- découragement
-- ras-le-bol
-- pression émotionnelle dans le cadre du travail du cabinet
-
-Exemples :
-- “J’en peux plus”
-- “Je suis débordé”
-- “Je sature avec le cabinet”
-
-Level :
-- max
-
-Docs :
-- jamais
-
-Rôle :
-- soutenir avec tact
-- aider à clarifier
-- rester professionnelle
-- ne pas basculer en psychologue ni en discussion hors cadre
-
 ═══════════════════════════════════════════════════════════════
 PRIORITÉ DES INTENTS (STRICT)
-
-Tu dois toujours sélectionner UN SEUL intent principal.
-
-Ordre de priorité (du plus fort au plus faible) :
 
 1. product_support
 2. task_execution
@@ -423,332 +167,108 @@ Ordre de priorité (du plus fort au plus faible) :
 7. out_of_scope
 8. amabilities
 
----
-
-RÈGLES D’ARBITRAGE
-
-1) PRODUCT_SUPPORT PRIORITAIRE
-
-Si le message porte sur :
-- setup
-- bug
-- configuration
-- connecteurs
-- permissions
-- fonctionnement produit
-
-→ intent = product_support
-
-Même si :
-- une action est demandée
-- un contexte cabinet est mentionné
-
-Ex :
-“Comment connecter la boîte mail ?” → product_support
-
----
-
-2) TASK_EXECUTION PRIORITAIRE SUR TOUT LE RESTE (SAUF PRODUCT_SUPPORT)
-
-Si le message contient une intention d’action concrète :
-- préparer
-- créer
-- organiser
-- vérifier
-- trouver
-- envoyer
-- programmer
-- générer
-- structurer un livrable
-
-→ intent = task_execution
-
-Même si :
-- un patient est mentionné
-- le sujet est médical
-- le contexte est cabinet
-
-Exemples :
-- “A-t-on reçu un mail du patient X ?” → task_execution
-- “Prépare une réponse à ce patient” → task_execution
-- “Organise le suivi post-consultation” → task_execution
-
-RÈGLE :
-👉 verbe d’action concret = task_execution
-
----
-
-3) PATIENT_CASE_ASSISTANCE AVANT MEDICAL_ASSISTANCE
-
-Si :
-- un patient précis est mentionné
-- un cas clinique est décrit
-- un raisonnement appliqué à un cas est demandé
-
-→ intent = patient_case_assistance
-
-Exemples :
-- “J’ai un patient avec…” → patient_case_assistance
-- “Que penses-tu de ce tableau clinique ?” → patient_case_assistance
-
-Même si :
-- la question est médicale complexe
-
-RÈGLE :
-👉 cas réel = patient_case_assistance
-
----
-
-4) MEDICAL_ASSISTANCE (GÉNÉRAL)
-
-Si :
-- la question est médicale
-- mais SANS cas patient précis
-
-→ intent = medical_assistance
-
-Exemples :
-- “Quels sont les diagnostics différentiels de…” → medical_assistance
-- “Que disent les recommandations sur…” → medical_assistance
-
----
-
-5) EMOTIONAL_SUPPORT
-
-Si :
-- le message exprime fatigue, tension, doute, surcharge
-- sans demande d’action ni question technique
-
-→ intent = emotional_support
-
-Si une action est demandée → task_execution prend le dessus
-
----
-
-6) CABINET_ASSISTANCE
-
-Si :
-- organisation du cabinet
-- secrétariat
-- coordination
-- bonnes pratiques métier
-- compréhension des capacités Lisa côté cabinet
-
-→ intent = cabinet_assistance
-
-Mais :
-- si demande d’action → task_execution
-- si setup produit → product_support
-
----
-
-7) OUT_OF_SCOPE
-
-Si :
-- le message est hors travail,
-- hors cabinet,
-- hors médical,
-- hors produit HeyLisa,
-- et n’apporte aucune utilité professionnelle claire,
-
-→ intent = out_of_scope
-
-Exemples :
-- “Tu as vu le score du PSG ?”
-- “Tu penses quoi de cette série ?”
-- “On parle de foot ?”
-
-RÈGLE :
-👉 sujet hors cadre utile = out_of_scope
-
----
-
-8) AMABILITIES (DERNIER NIVEAU)
-
-Si :
-- simple politesse
-- sans autre intention
-
-→ intent = amabilities
-
-Exemples :
-- “Merci”
-- “Bonjour”
-- “Bonne nuit”
-
----
-
-RÈGLES CRITIQUES TRANSVERSES
-
-- Tu ne sélectionnes JAMAIS plusieurs intents
-- Tu privilégies toujours l’intention la plus opérationnelle
-- En cas de doute entre analyse et action → action gagne (task_execution)
-- En cas de doute entre cas patient et médical général → cas patient gagne
-- En cas de doute entre produit et reste → produit gagne
-
----
-
-RÈGLE D’OR
-
-Tu choisis l’intent qui correspond à
-👉 ce que l’utilisateur attend concrètement comme sortie,
-pas seulement au sujet évoqué.
+RÈGLE CLÉ :
+👉 Si une action concrète est demandée → task_execution
 
 ═══════════════════════════════════════════════════════════════
-RÈGLE CLÉ — DYNAMIQUE DE CONVERSATION
+DÉFINITION DES INTENTS (VERSION COURTE)
 
-Tu ne classes jamais l’intent uniquement sur le dernier message.
+amabilities  
+→ politesse uniquement
 
-Tu dois tenir compte des derniers messages de ctx.history.messages.
+out_of_scope  
+→ aucun lien pro / cabinet / santé
 
-Si le user approfondit un point de la réponse précédente de Lisa,
-tu conserves l’intent de fond au lieu de reclasser trop vite.
+medical_assistance  
+→ question médicale générale (pas de patient précis)
 
-Un message comme :
-- “ok”
-- “vas-y”
-- “continue”
-- “très utile mais besoin de plus de détails”
-- “montre-moi plus concrètement”
-sert souvent à poursuivre le sujet déjà en cours.
+patient_case_assistance  
+→ cas patient concret
 
-═══════════════════════════════════════════════════════════════
-DOCS SCOPES POLICY (STRICT)
+cabinet_assistance  
+→ organisation / fonctionnement cabinet
 
-Tu peux demander des docs via :
-- scope_need = true
-- scopes_selected = [ ... ] (1 à 5 scopes maximum)
+product_support  
+→ bug / setup / connecteurs
 
-Règles :
-1. Tu n’inventes jamais de scope.
-2. Tu choisis uniquement dans la liste “DOCUMENTATION DISPONIBLE (SCOPES EXACTS)”.
-3. product_support :
-   - si un scope pertinent existe, scope_need = true obligatoire.
-4. cabinet_assistance :
-   - scope_need = true si les docs permettent une réponse plus précise sur les capacités réelles de Lisa
-     ou sur un process cabinet / produit documenté.
-5. medical_assistance :
-   - scope_need = true seulement si une doc interne pertinente existe réellement.
-   - sinon need_web=true si l’info doit être récente, réglementaire ou sourcée.
-6. patient_case_assistance :
-   - scope_need = true seulement si un scope pertinent existe réellement.
-7. task_execution :
-   - scope_need = true si la demande dépend du produit, du setup, d’un connecteur ou d’une capacité documentée.
-8. emotional_support et amabilities :
-   - scope_need = false
-   - scopes_selected = []
-9. discovery_capabilities :
-   - scope_need = true obligatoire
-   - inclure en priorité discovery.medical_assistant
-10. Si aucun scope pertinent n’existe dans la liste disponible :
-   - scope_need = false
-   - scopes_selected = []
+task_execution  
+→ action concrète demandée  
+(ex : lire mails, répondre, créer, vérifier)
+
+emotional_support  
+→ fatigue / surcharge
 
 ═══════════════════════════════════════════════════════════════
-WEB SEARCH (need_web)
+TASK EXECUTION — RÈGLES CRITIQUES
 
-need_web=true si au moins une condition est vraie :
-A) l’information est volatile, récente ou susceptible d’avoir changé
-B) la réponse exige une exactitude critique
-C) la demande appelle des sources ou références vérifiables
-D) la question médicale porte sur recommandations, études, protocoles, règles, procédures ou faits contemporains
-E) la question implique un arbitrage médical qui bénéficie d’un état de l’art récent
-F) la demande touche à posologie, sécurité, contre-indications, surveillance, guideline, conduite à tenir ou synthèse de littérature
+Si intent = task_execution :
 
-need_web=false seulement si :
-- la réponse peut être donnée à partir de connaissances stables et très bien établies
-- le contexte fourni suffit réellement
-- la demande porte sur une clarification simple, non dépendante de faits externes
-- il ne s’agit ni d’une recommandation récente, ni d’une question réglementaire, ni d’une synthèse d’études, ni d’un sujet où la fraîcheur de l’information change la qualité de la réponse
+- task_detected = true si une action plausible existe
+- task_key = meilleure clé candidate (même approximative)
+- sinon null
 
-RÈGLE MÉDICALE SPÉCIFIQUE
+Tu DOIS remplir correctement :
 
-Pour les questions médicales :
-- tu privilégies presque toujours need_web=true
-- sauf si la question est manifestement simple, stable, courte et bien établie
-- en cas de doute, tu actives need_web=true
+- task_key
+- task_status
+- required_integrations
+- missing_integrations
+- can_execute_now
 
-QUALITÉ ATTENDUE DU web_search_prompt
-
-Si need_web=true, web_search_prompt doit :
-- faire 3 à 6 lignes maximum
-- être orienté recherche de haute qualité, pas grand public
-- inclure le contexte clinique ou métier utile
-- inclure les mots-clés médicaux centraux
-- inclure une contrainte explicite de fiabilité
-- préciser si l’objectif est :
-  - recommandations officielles,
-  - synthèse d’études,
-  - conduite pratique,
-  - sécurité / posologie / contre-indications,
-  - état des controverses,
-  - sources récentes
-
-SOURCES À PRIVILÉGIER
-
-Le web_search_prompt doit orienter vers :
-- recommandations officielles
-- sociétés savantes reconnues
-- autorités de santé nationales et internationales
-- revues médicales sérieuses
-- méta-analyses, revues systématiques, essais cliniques, consensus
-- institutions académiques / hospitalo-universitaires reconnues
-
-SOURCES À ÉVITER
-
-Le web_search_prompt doit implicitement ou explicitement éviter :
-- blogs
-- sites marketing
-- articles grand public faibles
-- contenus sensationnalistes
-- sources non médicales
-- pages peu traçables
-
-PORTÉE GÉOGRAPHIQUE
-
-Tu ne limites pas la recherche à la France sauf si le sujet l’exige.
-Pour les sujets médicaux, tu privilégies une recherche internationale quand pertinent.
-Tu précises un pays seulement si la demande dépend d’un cadre local :
-- réglementation
-- remboursement
-- autorisation
-- protocole national
-- organisation administrative locale
-
-FORMAT DU web_search_prompt
-
-Le web_search_prompt doit être concret et exploitable.
-Il ne doit pas être vague.
-
-Exigences :
-- inclure le sujet exact
-- inclure le type d’information recherchée
-- inclure le niveau de preuve attendu si pertinent
-- inclure la contrainte “sources fiables / officielles / médicales reconnues”
-- si utile, inclure “international guidelines”, “systematic review”, “meta-analysis”, “consensus”, “safety”, “dose”, “contraindications”, “clinical recommendations”
-
-EXEMPLES DE BONNE INTENTION DE RECHERCHE
-
-- rechercher recommandations récentes + sociétés savantes + revue de littérature
-- rechercher sécurité / posologie / contre-indications avec sources médicales fiables
-- rechercher état des recommandations internationales et points de divergence
-- rechercher synthèse de données robustes plutôt qu’articles généralistes
-
-Si need_web=true :
-- web_search_prompt doit être non vide
-- il doit être assez précis pour guider une vraie recherche fiable
-- il doit refléter le bon niveau d’exigence du sujet
+Tu ne mets JAMAIS la task dans task_detected.
 
 ═══════════════════════════════════════════════════════════════
-RÈGLES SUPPLÉMENTAIRES
+DOCS SCOPES — RÈGLES STRICTES
 
-Ton rôle est seulement de choisir :
-  - intent
-  - context_level
-  - need_web
-  - web_search_prompt
-  - scope_need
-  - scopes_selected
+Tu peux utiliser :
+- scope_need = true/false
+- scopes_selected = []
+
+RÈGLES :
+- Tu choisis UNIQUEMENT dans la liste fournie
+- Tu copies EXACTEMENT les strings
+- Tu n’inventes rien
+- Tu ne simplifies rien
+
+Si aucun scope ne matche :
+→ scopes_selected = []
+
+Cas :
+- product_support → scopes obligatoires si dispo
+- task_execution → scopes si lié produit
+- discovery → toujours inclure discovery.medical_assistant
+
+═══════════════════════════════════════════════════════════════
+WEB SEARCH
+
+need_web = true si :
+- info médicale récente
+- recommandations / guidelines
+- besoin de sources fiables
+
+Sinon false.
+
+Si true :
+→ web_search_prompt obligatoire, précis, orienté sources fiables
+
+═══════════════════════════════════════════════════════════════
+CONTINUITÉ CONVERSATIONNELLE
+
+Tu dois tenir compte :
+- ctx.history.messages
+- CONVERSATION_LOOPS_ACTIVES
+
+Si le message continue un sujet existant :
+→ ne change pas d’intent inutilement
+
+═══════════════════════════════════════════════════════════════
+RÈGLES FINALES
+
+- Un seul intent
+- Pas d’invention
+- Respect strict du JSON
+- Priorité à l’action concrète
+- Si doute → réponse conservative (null / [])
 
 ═══════════════════════════════════════════════════════════════
 {render_nodes_whitelist_block()}
@@ -760,7 +280,23 @@ JSON_SCHEMA_HINT = {
     "ok": True,
     "language": "fr",
     "intent": "cabinet_assistance",
+    "primary_brain_key": "cabinet_assistance",
+    "secondary_brain_key": None,
+    "secondary_brain_reason": None,
+    "resume_loop_id": None,
+    "keep_warm_topic": False,
     "context_level": "medium",
+    "task_execution_context": {
+        "task_detected": False,
+        "task_key": None,
+        "task_label": None,
+        "task_status": "unknown",
+        "task_category": None,
+        "required_integrations": [],
+        "connected_integrations": [],
+        "missing_integrations": [],
+        "can_execute_now": False
+    },
     "need_web": False,
     "web_search_prompt": None,
     "confidence": 0.92,
@@ -799,6 +335,34 @@ def _state_from_ctx(ctx: Optional[Dict[str, Any]]) -> str:
         return s
     except Exception:
         return ""
+
+def _compact_conversation_loops(ctx: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    loops = (((ctx or {}).get("loops") or {}).get("conversation_loops") or [])
+    if not isinstance(loops, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+
+    for loop in loops[:5]:
+        if not isinstance(loop, dict):
+            continue
+
+        out.append(
+            {
+                "id": loop.get("id"),
+                "loop_type": loop.get("loop_type"),
+                "title": loop.get("title"),
+                "summary": loop.get("summary"),
+                "priority": loop.get("priority"),
+                "score": loop.get("score"),
+                "resume_brain_key": loop.get("resume_brain_key"),
+                "origin_brain_key": loop.get("origin_brain_key"),
+                "why_now": loop.get("why_now"),
+                "updated_at": loop.get("updated_at"),
+            }
+        )
+
+    return out
 
 def _trial_feedback_active_from_ctx(ctx: Optional[Dict[str, Any]]) -> bool:
     try:
@@ -851,6 +415,241 @@ def _render_docs_scopes_block(ctx: Optional[Dict[str, Any]]) -> str:
         f"{lines}\n"
     )
 
+
+def _get_available_doc_scopes(ctx: Optional[Dict[str, Any]]) -> List[str]:
+    scopes = []
+    try:
+        docs = (ctx or {}).get("docs") or {}
+        scopes = docs.get("scopes_all") or []
+    except Exception:
+        scopes = []
+
+    clean: List[str] = []
+    for s in scopes[:500]:
+        if isinstance(s, str):
+            ss = s.strip()
+            if ss:
+                clean.append(ss)
+
+    # dédoublonnage en gardant l’ordre
+    seen = set()
+    out: List[str] = []
+    for s in clean:
+        if s not in seen:
+            out.append(s)
+            seen.add(s)
+
+    return out
+
+
+def _filter_scopes_selected_exact(
+    raw_scopes: Any,
+    available_scopes: List[str],
+    *,
+    max_len: int = DOCS_SCOPES_MAX,
+) -> Dict[str, Any]:
+    """
+    Garde UNIQUEMENT les scopes exacts présents dans available_scopes.
+    Aucun renommage, aucune approximation, aucune invention.
+    """
+    valid_set = set(available_scopes)
+    requested_raw: List[str] = []
+    kept: List[str] = []
+    rejected: List[str] = []
+
+    if isinstance(raw_scopes, list):
+        for s in raw_scopes[: max_len * 5]:
+            if not isinstance(s, str):
+                continue
+            ss = s.strip()
+            if not ss:
+                continue
+
+            requested_raw.append(ss)
+
+            if ss in valid_set:
+                if ss not in kept:
+                    kept.append(ss)
+            else:
+                rejected.append(ss)
+
+    return {
+        "requested_raw": requested_raw,
+        "kept": kept[:max_len],
+        "rejected": rejected,
+    }
+
+
+def _normalize_catalog_key(s: Any) -> str:
+    s = str(s or "").strip().lower()
+    if not s:
+        return ""
+    # normalisation légère, purement structurelle
+    s = s.replace("-", "_").replace(" ", "_")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("._")
+
+
+def _tokenize_catalog_key(s: Any) -> List[str]:
+    norm = _normalize_catalog_key(s)
+    if not norm:
+        return []
+    parts: List[str] = []
+    for chunk in norm.replace(".", "_").split("_"):
+        chunk = chunk.strip()
+        if chunk:
+            parts.append(chunk)
+    return parts
+
+
+def _score_catalog_key_match(candidate: str, target: str) -> float:
+    """
+    Score déterministe entre 0 et 1.
+    On compare UNE clé candidate à UNE clé réelle du catalogue.
+    Aucun raisonnement sur la langue utilisateur ici.
+    """
+    c = _normalize_catalog_key(candidate)
+    t = _normalize_catalog_key(target)
+
+    if not c or not t:
+        return 0.0
+
+    if c == t:
+        return 1.0
+
+    base_ratio = SequenceMatcher(None, c, t).ratio()
+
+    c_tokens = set(_tokenize_catalog_key(c))
+    t_tokens = set(_tokenize_catalog_key(t))
+
+    token_overlap = 0.0
+    if c_tokens and t_tokens:
+        inter = len(c_tokens & t_tokens)
+        union = len(c_tokens | t_tokens)
+        if union > 0:
+            token_overlap = inter / union
+
+    prefix_bonus = 0.0
+    if t.startswith(c) or c.startswith(t):
+        prefix_bonus = 0.12
+
+    contains_bonus = 0.0
+    if c in t or t in c:
+        contains_bonus = 0.08
+
+    score = (base_ratio * 0.72) + (token_overlap * 0.20) + prefix_bonus + contains_bonus
+    return min(score, 1.0)
+
+
+def _resolve_best_catalog_key(
+    *,
+    candidate: Any,
+    available_keys: List[str],
+    min_score: float = 0.72,
+) -> Dict[str, Any]:
+    """
+    Résout UNE clé candidate vers UNE clé canonique du catalogue.
+    """
+    candidate_norm = _normalize_catalog_key(candidate)
+
+    if not candidate_norm:
+        return {
+            "requested_raw": str(candidate or ""),
+            "requested_norm": "",
+            "matched": None,
+            "score": 0.0,
+            "accepted": False,
+        }
+
+    clean_available = []
+    for x in available_keys or []:
+        if isinstance(x, str) and x.strip():
+            clean_available.append(x.strip())
+
+    if not clean_available:
+        return {
+            "requested_raw": str(candidate or ""),
+            "requested_norm": candidate_norm,
+            "matched": None,
+            "score": 0.0,
+            "accepted": False,
+        }
+
+    # exact match d'abord
+    for key in clean_available:
+        if _normalize_catalog_key(key) == candidate_norm:
+            return {
+                "requested_raw": str(candidate or ""),
+                "requested_norm": candidate_norm,
+                "matched": key,
+                "score": 1.0,
+                "accepted": True,
+            }
+
+    best_key = None
+    best_score = 0.0
+
+    for key in clean_available:
+        score = _score_catalog_key_match(candidate_norm, key)
+        if score > best_score:
+            best_score = score
+            best_key = key
+
+    return {
+        "requested_raw": str(candidate or ""),
+        "requested_norm": candidate_norm,
+        "matched": best_key if best_score >= min_score else None,
+        "score": round(best_score, 4),
+        "accepted": bool(best_score >= min_score and best_key),
+    }
+
+
+def _resolve_catalog_keys(
+    *,
+    candidates: List[str],
+    available_keys: List[str],
+    max_len: int,
+    min_score: float = 0.72,
+) -> Dict[str, Any]:
+    """
+    Résout une liste de clés candidates vers le catalogue réel.
+    Retourne :
+    - kept : clés canoniques retenues
+    - rejected : candidates rejetées
+    - details : debug fin
+    """
+    kept: List[str] = []
+    rejected: List[str] = []
+    details: List[Dict[str, Any]] = []
+
+    seen = set()
+
+    for candidate in candidates[:max_len]:
+        res = _resolve_best_catalog_key(
+            candidate=candidate,
+            available_keys=available_keys,
+            min_score=min_score,
+        )
+        details.append(res)
+
+        matched = res.get("matched")
+        accepted = bool(res.get("accepted") is True)
+
+        if accepted and isinstance(matched, str) and matched not in seen:
+            kept.append(matched)
+            seen.add(matched)
+        else:
+            rejected.append(str(candidate))
+
+    return {
+        "requested_raw": [str(x) for x in candidates[:max_len]],
+        "kept": kept[:max_len],
+        "rejected": rejected,
+        "details": details,
+    }
+
+
 def _fallback_plan_minimal(language: str = "fr") -> Dict[str, Any]:
     """
     Filet de sécurité uniquement.
@@ -870,6 +669,12 @@ def _fallback_plan_minimal(language: str = "fr") -> Dict[str, Any]:
                 "depends_on": ["A", "B"],
                 "inputs": {
                     "intent": "cabinet_assistance",
+                    "primary_brain_key": "cabinet_assistance",
+                    "secondary_brain_key": None,
+                    "secondary_brain_reason": None,
+                    "resume_loop_id": None,
+                    "keep_warm_topic": False,
+                    "task_execution_context": None,
                     "language": language,
                     "tone": "warm",
                     "need_web": False,
@@ -1009,7 +814,13 @@ def _build_plan_minimal(
     language: str,
     state: StateType,
     intent: str,
+    primary_brain_key: Optional[str],
+    secondary_brain_key: Optional[str],
+    secondary_brain_reason: Optional[str],
+    resume_loop_id: Optional[str],
+    keep_warm_topic: bool,
     mode: str,
+    task_execution_context: Optional[Dict[str, Any]],
     need_web: bool,
     web_search_prompt: Optional[str],
     context_level: str,
@@ -1101,6 +912,12 @@ def _build_plan_minimal(
             "inputs": {
                 "state": state,
                 "intent": intent,
+                "primary_brain_key": primary_brain_key,
+                "secondary_brain_key": secondary_brain_key,
+                "secondary_brain_reason": secondary_brain_reason,
+                "resume_loop_id": resume_loop_id,
+                "keep_warm_topic": bool(keep_warm_topic),
+                "task_execution_context": task_execution_context,
                 "language": language,
                 "tone": "warm",
                 "need_web": need_web,
@@ -1206,6 +1023,259 @@ def _sanitize_plan_or_fallback(
 
     return plan
 
+def _normalize_brain_key(x: Any) -> Optional[str]:
+    s = str(x or "").strip()
+    return s or None
+
+
+def _state_covers_brain(state: str, brain_key: Optional[str]) -> bool:
+    b = str(brain_key or "").strip()
+    s = str(state or "").strip()
+
+    if not b or not s:
+        return False
+
+    if b == s:
+        return True
+
+    if b == f"{s}_light":
+        return True
+
+    # cas important : discovery light déjà couverte par state discovery
+    if s == "discovery_capabilities" and b == "discovery_capabilities_light":
+        return True
+
+    return False
+
+
+def _pick_matching_loop(
+    *,
+    loops: List[Dict[str, Any]],
+    user_message: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Heuristique simple et robuste pour choisir UNE loop potentiellement pertinente.
+    Pour l’instant :
+    - on privilégie les loops qui ont un resume_brain_key
+    - puis score décroissant
+    - puis updated_at décroissant implicite si déjà trié en amont
+    """
+    if not isinstance(loops, list) or not loops:
+        return None
+
+    ranked: List[Dict[str, Any]] = []
+
+    for loop in loops:
+        if not isinstance(loop, dict):
+            continue
+
+        resume_brain_key = str(loop.get("resume_brain_key") or "").strip()
+        score_raw = loop.get("score")
+        try:
+            score = float(score_raw or 0.0)
+        except Exception:
+            score = 0.0
+
+        ranked.append(
+            {
+                **loop,
+                "_has_resume_brain": bool(resume_brain_key),
+                "_score_num": score,
+            }
+        )
+
+    if not ranked:
+        return None
+
+    ranked.sort(
+        key=lambda x: (
+            1 if x.get("_has_resume_brain") else 0,
+            x.get("_score_num", 0.0),
+        ),
+        reverse=True,
+    )
+
+    return ranked[0]
+
+
+def _resolve_brain_strategy(
+    *,
+    state: str,
+    intent_final: str,
+    trial_feedback_prompt_enabled: bool,
+    conversation_loops: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Règles :
+    - primary_brain_key = intent_final
+    - secondary_brain_key possible via loop active pertinente
+    - pas de secondary si le state couvre déjà ce sujet
+    - pas de secondary identique au primary
+    - si trial feedback est actif et non couvert par state/primary,
+      on peut l’utiliser comme secondary de repli
+    """
+    primary_brain_key = intent_final or None
+
+    selected_loop = _pick_matching_loop(
+        loops=conversation_loops,
+        user_message="",
+    )
+
+    secondary_brain_key: Optional[str] = None
+    secondary_brain_reason: Optional[str] = None
+    resume_loop_id: Optional[str] = None
+    keep_warm_topic = False
+
+    if isinstance(selected_loop, dict):
+        candidate = _normalize_brain_key(selected_loop.get("resume_brain_key"))
+
+        if (
+            candidate
+            and candidate != primary_brain_key
+            and not _state_covers_brain(state, candidate)
+        ):
+            secondary_brain_key = candidate
+            secondary_brain_reason = "matched_active_loop"
+            resume_loop_id = str(selected_loop.get("id") or "") or None
+            keep_warm_topic = True
+
+    # fallback trial feedback uniquement si rien d’autre n’a été retenu
+    if (
+        not secondary_brain_key
+        and trial_feedback_prompt_enabled
+        and primary_brain_key not in {"trial_feedback", "trial_feedback_light"}
+        and not _state_covers_brain(state, "trial_feedback_light")
+    ):
+        secondary_brain_key = "trial_feedback_light"
+        secondary_brain_reason = "trial_feedback_pending"
+        resume_loop_id = None
+        keep_warm_topic = True
+
+    return {
+        "primary_brain_key": primary_brain_key,
+        "secondary_brain_key": secondary_brain_key,
+        "secondary_brain_reason": secondary_brain_reason,
+        "resume_loop_id": resume_loop_id,
+        "keep_warm_topic": keep_warm_topic,
+        "selected_loop": selected_loop,
+    }
+
+def _normalize_text(s: Any) -> str:
+    return str(s or "").strip().lower()
+
+
+def _extract_actions_catalog(ctx: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    actions = (((ctx or {}).get("actions") or {}).get("actions") or [])
+    if not isinstance(actions, list):
+        return []
+    return [a for a in actions if isinstance(a, dict)]
+
+
+def _extract_connected_integrations(ctx: Optional[Dict[str, Any]]) -> List[str]:
+    integrations = (((ctx or {}).get("integrations") or {}).get("integrations") or [])
+    if not isinstance(integrations, list):
+        return []
+
+    out: List[str] = []
+    for item in integrations:
+        if not isinstance(item, dict):
+            continue
+        if item.get("connected") is True:
+            key = str(item.get("integration_key") or "").strip()
+            if key:
+                out.append(key)
+
+    return out
+
+
+def _resolve_task_execution_context(
+    *,
+    llm_task_key: Any,
+    ctx: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Résolution déterministe :
+    - prend UNE task_key candidate issue du LLM
+    - la mappe vers la task_key canonique du catalogue
+    - reconstruit le contexte d’exécution depuis la vraie action back
+    """
+
+    actions = _extract_actions_catalog(ctx)
+    connected_integrations = _extract_connected_integrations(ctx)
+
+    available_task_keys: List[str] = []
+    actions_by_key: Dict[str, Dict[str, Any]] = {}
+
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+
+        task_key = str(action.get("task_key") or "").strip()
+        if not task_key:
+            continue
+
+        if task_key not in actions_by_key:
+            actions_by_key[task_key] = action
+            available_task_keys.append(task_key)
+
+    resolved = _resolve_best_catalog_key(
+        candidate=llm_task_key,
+        available_keys=available_task_keys,
+        min_score=0.72,
+    )
+
+    matched_task_key = resolved.get("matched")
+    if not resolved.get("accepted") or not matched_task_key:
+        return {
+            "task_detected": False,
+            "task_key": None,
+            "task_label": None,
+            "task_status": "unknown",
+            "task_category": None,
+            "required_integrations": [],
+            "connected_integrations": connected_integrations,
+            "missing_integrations": [],
+            "can_execute_now": False,
+            "resolver": {
+                "requested_raw": str(llm_task_key or ""),
+                "requested_norm": resolved.get("requested_norm"),
+                "matched": None,
+                "score": float(resolved.get("score") or 0.0),
+                "accepted": False,
+            },
+        }
+
+    action = actions_by_key.get(matched_task_key) or {}
+
+    required_integrations = action.get("required_integrations") or []
+    if not isinstance(required_integrations, list):
+        required_integrations = []
+
+    required_integrations = [str(x).strip() for x in required_integrations if str(x).strip()]
+    missing_integrations = [x for x in required_integrations if x not in connected_integrations]
+
+    task_status = str(action.get("status") or "unknown").strip().lower()
+    can_execute_now = task_status == "active" and len(missing_integrations) == 0
+
+    return {
+        "task_detected": True,
+        "task_key": str(action.get("task_key") or "").strip() or None,
+        "task_label": str(action.get("label") or "").strip() or None,
+        "task_status": task_status,
+        "task_category": str(action.get("category") or "").strip() or None,
+        "required_integrations": required_integrations,
+        "connected_integrations": connected_integrations,
+        "missing_integrations": missing_integrations,
+        "can_execute_now": can_execute_now,
+        "resolver": {
+            "requested_raw": str(llm_task_key or ""),
+            "requested_norm": resolved.get("requested_norm"),
+            "matched": matched_task_key,
+            "score": float(resolved.get("score") or 0.0),
+            "accepted": True,
+        },
+    }
+
 class OrchestratorAgent:
     """
     LLM #1 — léger.
@@ -1216,16 +1286,32 @@ class OrchestratorAgent:
         self.llm = llm
 
     async def run(self, *, user_message: str, ctx: Optional[Dict[str, Any]] = None) -> OrchestratorResult:
+        conversation_loops = _compact_conversation_loops(ctx or {})
+        has_conversation_loops = len(conversation_loops) > 0
+
         ctx_json = json.dumps(ctx or {}, ensure_ascii=False, default=str)
+
+        loops_block = f"""CONVERSATION_LOOPS_ACTIVES
+    - has_conversation_loops: {has_conversation_loops}
+    - loops_count: {len(conversation_loops)}
+    - loops:
+    {json.dumps(conversation_loops, ensure_ascii=False, indent=2)}
+    """
 
         user_prompt = f"""Message utilisateur:
     {user_message}
+
+    {loops_block}
 
     CONTEXTE (JSON, source de vérité): 
     {ctx_json}
 
     RÈGLES CRITIQUES:
     - Tu DOIS utiliser le CONTEXTE pour choisir intent.
+    - Tu DOIS tenir compte des CONVERSATION_LOOPS_ACTIVES si elles existent.
+    - Si le message utilisateur semble reprendre, approfondir, préciser ou déplacer légèrement un sujet déjà vivant dans une loop active,
+      tu dois conserver le sujet de fond au lieu de reclasser trop vite sur un nouveau sujet superficiel.
+    - Une conversation_loop active avec resume_brain_key pertinent est un signal fort de continuité conversationnelle.
     - transition_window et transition_reason viennent du CONTEXTE (ctx.gates). Tu ne les inventes jamais.
     - Tu peux les recopier tels quels dans ta sortie si tu les exposes, sinon ignore-les.
 
@@ -1248,6 +1334,18 @@ class OrchestratorAgent:
                 docs_scopes_count=len(docs_scopes_all),
                 docs_scopes_sample=docs_scopes_all[:10],
                 docs_block_len=len(docs_block or ""),
+            )
+        except Exception:
+            pass
+
+        try:
+            from app.core.chat_logger import chat_logger
+            chat_logger.info(
+                "chat.orchestrator.conversation_loops",
+                has_conversation_loops=has_conversation_loops,
+                loops_count=len(conversation_loops),
+                loop_types=[str(x.get("loop_type") or "") for x in conversation_loops],
+                resume_brain_keys=[str(x.get("resume_brain_key") or "") for x in conversation_loops],
             )
         except Exception:
             pass
@@ -1287,7 +1385,13 @@ class OrchestratorAgent:
                 language=language,
                 state=_normalize_state(_state_from_ctx(ctx)),
                 intent=intent,
+                primary_brain_key=intent,
+                secondary_brain_key=None,
+                secondary_brain_reason=None,
+                resume_loop_id=None,
+                keep_warm_topic=False,
                 context_level=level,
+                task_execution_context=None,
                 need_web=False,
                 web_search_prompt=None,
                 confidence=0.0,
@@ -1306,7 +1410,13 @@ class OrchestratorAgent:
                 language="fr",
                 state=_normalize_state(_state_from_ctx(ctx)),
                 intent="cabinet_assistance",
+                primary_brain_key="cabinet_assistance",
+                secondary_brain_key=None,
+                secondary_brain_reason=None,
+                resume_loop_id=None,
+                keep_warm_topic=False,
                 context_level="medium",
+                task_execution_context=None,
                 need_web=False,
                 web_search_prompt=None,
                 confidence=0.0,
@@ -1329,6 +1439,11 @@ class OrchestratorAgent:
         intent = data.get("intent") or "cabinet_assistance"
         level = data.get("context_level") or "medium"
         confidence = float(data.get("confidence") or 0.0)
+        primary_brain_key_llm = _normalize_brain_key(data.get("primary_brain_key"))
+        secondary_brain_key_llm = _normalize_brain_key(data.get("secondary_brain_key"))
+        secondary_brain_reason_llm = str(data.get("secondary_brain_reason") or "").strip() or None
+        resume_loop_id_llm = str(data.get("resume_loop_id") or "").strip() or None
+        keep_warm_topic_llm = bool(data.get("keep_warm_topic") is True)
 
         need_web = bool(data.get("need_web") or False)
         web_search_prompt = data.get("web_search_prompt", None)
@@ -1355,12 +1470,37 @@ class OrchestratorAgent:
         ob_pro_mode = bool(ob.get("pro_mode") is True)
         smalltalk_intro_eligible = bool(((ctx or {}).get("gates") or {}).get("smalltalk_intro_eligible"))
 
+        available_scopes = _get_available_doc_scopes(ctx)
+
         raw_scopes = data.get("scopes_selected") or []
-        scopes_selected: List[str] = []
-        if isinstance(raw_scopes, list):
-            for s in raw_scopes[:DOCS_SCOPES_MAX]:
-                if isinstance(s, str) and s.strip():
-                    scopes_selected.append(s.strip())
+        if not isinstance(raw_scopes, list):
+            raw_scopes = []
+
+        raw_scopes_clean: List[str] = []
+        for s in raw_scopes[:DOCS_SCOPES_MAX]:
+            if isinstance(s, str) and s.strip():
+                raw_scopes_clean.append(s.strip())
+
+        scopes_filter = _resolve_catalog_keys(
+            candidates=raw_scopes_clean,
+            available_keys=available_scopes,
+            max_len=DOCS_SCOPES_MAX,
+            min_score=0.72,
+        )
+        scopes_selected: List[str] = scopes_filter["kept"]
+
+        # --- LOG FILTRAGE SCOPES ---
+        try:
+            from app.core.chat_logger import chat_logger
+            chat_logger.info(
+                "chat.orchestrator.docs_scopes_filter",
+                requested_raw=scopes_filter["requested_raw"],
+                kept=scopes_filter["kept"],
+                rejected=scopes_filter["rejected"],
+                available_scopes_count=len(available_scopes),
+            )
+        except Exception:
+            pass
 
     
 
@@ -1377,9 +1517,6 @@ class OrchestratorAgent:
         # =====================================================
         # HARD RULES DOCS
         # =====================================================
-        available_scopes = ((ctx or {}).get("docs") or {}).get("scopes_all") or []
-        if not isinstance(available_scopes, list):
-            available_scopes = []
 
         # jamais de docs pour ces intents
         if intent_final in {"emotional_support", "amabilities", "out_of_scope"}:
@@ -1450,12 +1587,74 @@ class OrchestratorAgent:
         capabilities = gate_out["capabilities"]
         signals = gate_out["signals"]
 
+        task_execution_context = None
+        if intent_final == "task_execution":
+            llm_task_key_candidate = None
+            raw_task_ctx = data.get("task_execution_context") or {}
+            if isinstance(raw_task_ctx, dict):
+                llm_task_key_candidate = raw_task_ctx.get("task_key")
+
+            task_execution_context = _resolve_task_execution_context(
+                llm_task_key=llm_task_key_candidate,
+                ctx=ctx,
+            )
+
+        try:
+            from app.core.chat_logger import chat_logger
+            chat_logger.info(
+                "chat.orchestrator.task_key_resolution",
+                llm_task_key_candidate=llm_task_key_candidate if intent_final == "task_execution" else None,
+                resolved_task_key=(task_execution_context or {}).get("task_key"),
+                task_detected=bool((task_execution_context or {}).get("task_detected")),
+                task_status=(task_execution_context or {}).get("task_status"),
+                resolver=((task_execution_context or {}).get("resolver") or {}),
+            )
+        except Exception:
+            pass
+
+        brain_strategy = _resolve_brain_strategy(
+            state=state,
+            intent_final=intent_final,
+            trial_feedback_prompt_enabled=trial_feedback_prompt_enabled,
+            conversation_loops=conversation_loops,
+        )
+
+        primary_brain_key = brain_strategy["primary_brain_key"]
+        secondary_brain_key = brain_strategy["secondary_brain_key"]
+        secondary_brain_reason = brain_strategy["secondary_brain_reason"]
+        resume_loop_id = brain_strategy["resume_loop_id"]
+        keep_warm_topic = brain_strategy["keep_warm_topic"]
+        selected_loop = brain_strategy["selected_loop"]
+
+        # Override très encadré du secondary brain proposé par le LLM :
+        # autorisé seulement si
+        # - il existe déjà un secondary candidat backend vide
+        # - la clé LLM n'est pas couverte par le state
+        # - la clé LLM n'est pas identique au primary
+        # On ne laisse PAS le LLM changer le primary brain.
+        if (
+            not secondary_brain_key
+            and secondary_brain_key_llm
+            and secondary_brain_key_llm != primary_brain_key
+            and not _state_covers_brain(state, secondary_brain_key_llm)
+        ):
+            secondary_brain_key = secondary_brain_key_llm
+            secondary_brain_reason = secondary_brain_reason_llm or "llm_secondary_brain"
+            resume_loop_id = resume_loop_id_llm or resume_loop_id
+            keep_warm_topic = keep_warm_topic_llm or keep_warm_topic
+
         # --- Plan stable (on ignore le "plan" du LLM, trop risqué) ---
         plan = _build_plan_minimal(
             language=language or "fr",
             state=state,
             intent=intent_final,
+            primary_brain_key=primary_brain_key,
+            secondary_brain_key=secondary_brain_key,
+            secondary_brain_reason=secondary_brain_reason,
+            resume_loop_id=resume_loop_id,
+            keep_warm_topic=keep_warm_topic,
             mode=mode,
+            task_execution_context=task_execution_context,
             need_web=need_web,
             web_search_prompt=web_search_prompt if need_web else None,
             context_level=level or "medium",
@@ -1485,6 +1684,24 @@ class OrchestratorAgent:
         debug["scopes_selected"] = scopes_selected
         debug["docs_scopes_count"] = int(((ctx or {}).get("docs") or {}).get("scopes_count") or 0)
         debug["trial_feedback_prompt_enabled"] = trial_feedback_prompt_enabled
+        debug["primary_brain_key"] = primary_brain_key
+        debug["secondary_brain_key"] = secondary_brain_key
+        debug["secondary_brain_reason"] = secondary_brain_reason
+        debug["resume_loop_id"] = resume_loop_id
+        debug["keep_warm_topic"] = keep_warm_topic
+        debug["selected_loop"] = selected_loop
+        debug["llm_primary_brain_key"] = primary_brain_key_llm
+        debug["llm_secondary_brain_key"] = secondary_brain_key_llm
+        debug["task_execution_context"] = task_execution_context
+        debug["task_detected"] = bool((task_execution_context or {}).get("task_detected"))
+        debug["task_key"] = (task_execution_context or {}).get("task_key")
+        debug["task_status"] = (task_execution_context or {}).get("task_status")
+        debug["task_can_execute_now"] = bool((task_execution_context or {}).get("can_execute_now"))
+        debug["task_missing_integrations"] = (task_execution_context or {}).get("missing_integrations") or []
+        debug["docs_available_scopes_count"] = len(available_scopes)
+        debug["docs_requested_raw_scopes"] = scopes_filter["requested_raw"]
+        debug["docs_rejected_scopes"] = scopes_filter["rejected"]
+        debug["docs_kept_scopes"] = scopes_filter["kept"]
 
         # --- Guardrails MINIMAUX (pas de correction d'intent) ---
 
@@ -1543,7 +1760,13 @@ class OrchestratorAgent:
                 language=language or "fr",
                 state=state,
                 intent="cabinet_assistance",
+                primary_brain_key="cabinet_assistance",
+                secondary_brain_key=None,
+                secondary_brain_reason=None,
+                resume_loop_id=None,
+                keep_warm_topic=False,
                 context_level="medium",
+                task_execution_context=None,
                 need_web=False,
                 web_search_prompt=None,
                 confidence=confidence,
@@ -1556,7 +1779,13 @@ class OrchestratorAgent:
             language=language or "fr",
             state=state,
             intent=intent_final,
+            primary_brain_key=primary_brain_key,
+            secondary_brain_key=secondary_brain_key,
+            secondary_brain_reason=secondary_brain_reason,
+            resume_loop_id=resume_loop_id,
+            keep_warm_topic=keep_warm_topic,
             context_level=level,
+            task_execution_context=task_execution_context,
             need_web=need_web,
             web_search_prompt=web_search_prompt if need_web else None,
             confidence=confidence,

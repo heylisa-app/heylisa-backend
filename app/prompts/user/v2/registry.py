@@ -1,3 +1,5 @@
+#app/prompts/user/v2/registry.py
+
 from __future__ import annotations
 
 from typing import Dict
@@ -15,6 +17,8 @@ from app.prompts.user.v2.blocks import (
     PRODUCT_SUPPORT,
     TASK_EXECUTION,
     OUT_OF_SCOPE,
+    DISCOVERY_CAPABILITIES_LIGHT,
+    TRIAL_FEEDBACK_LIGHT,
 )
 
 USER_BLOCKS_BY_STATE: Dict[str, UserPromptBlock] = {
@@ -34,4 +38,7 @@ USER_BLOCKS_BY_INTENT: Dict[str, UserPromptBlock] = {
     "out_of_scope": OUT_OF_SCOPE,
 }
 
-USER_BLOCKS_MISC: Dict[str, UserPromptBlock] = {}
+USER_BLOCKS_MISC: Dict[str, UserPromptBlock] = {
+    "discovery_capabilities_light": DISCOVERY_CAPABILITIES_LIGHT,
+    "trial_feedback_light": TRIAL_FEEDBACK_LIGHT,
+}
