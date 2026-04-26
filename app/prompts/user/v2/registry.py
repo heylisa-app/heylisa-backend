@@ -19,6 +19,7 @@ from app.prompts.user.v2.blocks import (
     OUT_OF_SCOPE,
     DISCOVERY_CAPABILITIES_LIGHT,
     TRIAL_FEEDBACK_LIGHT,
+    SEEK_INFOS_FOLLOWUP,
 )
 
 USER_BLOCKS_BY_STATE: Dict[str, UserPromptBlock] = {
@@ -36,6 +37,7 @@ USER_BLOCKS_BY_INTENT: Dict[str, UserPromptBlock] = {
     "product_support": PRODUCT_SUPPORT,
     "task_execution": TASK_EXECUTION,
     "out_of_scope": OUT_OF_SCOPE,
+    "seek_infos_followup": SEEK_INFOS_FOLLOWUP,
 }
 
 USER_BLOCKS_MISC: Dict[str, UserPromptBlock] = {

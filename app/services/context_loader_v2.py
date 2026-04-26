@@ -1,3 +1,5 @@
+#app/services/context_loader_v2.py
+
 from __future__ import annotations
 
 import json
@@ -639,6 +641,8 @@ async def load_context_light(
         },
     }
 
+    
+
 
 async def _load_billing_block(
     conn: Connection,
@@ -649,16 +653,22 @@ async def _load_billing_block(
         select
           public_user_id,
           billing_status,
-          billing_substatus,
           trial_started_at,
           trial_ends_at,
           grace_ends_at,
+          billing_activation_at,
+          billing_closed_at,
+          access_cutoff_at,
+          suspended_at,
+          close_reason,
+          billing_cycle,
           stripe_customer_id,
+          stripe_subscription_id,
+          stripe_checkout_session_id,
+          stripe_price_id,
           stripe_invoice_id,
+          stripe_invoice_status,
           stripe_hosted_invoice_url,
-          stripe_portal_url,
-          trial_feedback_context_active,
-          trial_feedback_context_closed,
           created_at,
           updated_at
         from public.user_billing_status
@@ -672,14 +682,22 @@ async def _load_billing_block(
         return {
             "public_user_id": str(public_user_id),
             "billing_status": None,
-            "billing_substatus": None,
             "trial_started_at": None,
             "trial_ends_at": None,
             "grace_ends_at": None,
+            "billing_activation_at": None,
+            "billing_closed_at": None,
+            "access_cutoff_at": None,
+            "suspended_at": None,
+            "close_reason": None,
+            "billing_cycle": None,
             "stripe_customer_id": None,
+            "stripe_subscription_id": None,
+            "stripe_checkout_session_id": None,
+            "stripe_price_id": None,
             "stripe_invoice_id": None,
+            "stripe_invoice_status": None,
             "stripe_hosted_invoice_url": None,
-            "stripe_portal_url": None,
             "trial_feedback_context_active": False,
             "trial_feedback_context_closed": False,
             "created_at": None,
@@ -691,16 +709,24 @@ async def _load_billing_block(
     return {
         "public_user_id": str(r.get("public_user_id")) if r.get("public_user_id") else str(public_user_id),
         "billing_status": r.get("billing_status"),
-        "billing_substatus": r.get("billing_substatus"),
         "trial_started_at": _safe_iso(r.get("trial_started_at")),
         "trial_ends_at": _safe_iso(r.get("trial_ends_at")),
         "grace_ends_at": _safe_iso(r.get("grace_ends_at")),
+        "billing_activation_at": _safe_iso(r.get("billing_activation_at")),
+        "billing_closed_at": _safe_iso(r.get("billing_closed_at")),
+        "access_cutoff_at": _safe_iso(r.get("access_cutoff_at")),
+        "suspended_at": _safe_iso(r.get("suspended_at")),
+        "close_reason": r.get("close_reason"),
+        "billing_cycle": r.get("billing_cycle"),
         "stripe_customer_id": r.get("stripe_customer_id"),
+        "stripe_subscription_id": r.get("stripe_subscription_id"),
+        "stripe_checkout_session_id": r.get("stripe_checkout_session_id"),
+        "stripe_price_id": r.get("stripe_price_id"),
         "stripe_invoice_id": r.get("stripe_invoice_id"),
+        "stripe_invoice_status": r.get("stripe_invoice_status"),
         "stripe_hosted_invoice_url": r.get("stripe_hosted_invoice_url"),
-        "stripe_portal_url": r.get("stripe_portal_url"),
-        "trial_feedback_context_active": bool(r.get("trial_feedback_context_active") is True),
-        "trial_feedback_context_closed": bool(r.get("trial_feedback_context_closed") is True),
+        "trial_feedback_context_active": False,
+        "trial_feedback_context_closed": False,
         "created_at": _safe_iso(r.get("created_at")),
         "updated_at": _safe_iso(r.get("updated_at")),
     }

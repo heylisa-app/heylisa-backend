@@ -10,6 +10,7 @@ from app.services.quota import get_quota_status
 from app.services.auth import get_auth_user_id_from_bearer, AuthError
 from app.services.chat import handle_chat_message, handle_chat_message_stream, ChatError
 from app.services.chat_intro import handle_chat_intro, handle_chat_intro_stream, ChatIntroError
+from app.api.v1.chat_open_items import router as chat_open_items_router
 from datetime import datetime
 from app.settings import settings
 
@@ -19,6 +20,7 @@ import traceback
 logger = logging.getLogger("heylisa.chat")
 
 router = APIRouter()
+router.include_router(chat_open_items_router, prefix="/v1")
 
 def _sse_event(event_name: str, data: dict) -> str:
     import json

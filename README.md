@@ -2872,3 +2872,523 @@ USER_BLOCKS_BY_INTENT: Dict[str, UserPromptBlock] = {
     "paywall_soft_warning": PAYWALL_SOFT_WARNING,
     "small_talk": SMALL_TALK,
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Mon diagnostic net
+
+Le problème principal n’est pas “un bug dans le chat”.
+
+Le problème principal, c’est que le moteur conversationnel exécute encore une ancienne philosophie produit alors que ton expérience réelle a changé.
+
+Et ça se voit partout.
+
+⸻
+
+Ce que disent les 4 fichiers
+
+1. state_resolver_v2.py + onboarding_state.py sont devenus hors modèle
+
+Aujourd’hui ton produit réel c’est :
+	•	signup
+	•	onboarding natif app
+	•	redirection chat
+	•	si historique vide → /chat/intro
+	•	ensuite → normal run
+	•	point
+
+Mais ton back continue de raisonner comme si le chat devait encore piloter :
+	•	smalltalk onboarding
+	•	discovery capabilities
+	•	progression onboarding
+	•	completion onboarding
+	•	relances aha_request / aha_moment / discovery_abort
+
+Donc le système force encore des comportements qui n’ont plus de raison d’exister.
+
+Effet concret
+
+Un simple message comme :
+
+“Bonjour Lisa, tu peux me vouvoyer stp”
+
+part en :
+	•	smalltalk_onboarding
+	•	fastpath
+	•	gros state block
+	•	logique discovery
+	•	flag aha_request
+
+C’est totalement incohérent avec le produit actuel.
+
+⸻
+
+2. Le “fastpath” n’est pas un fastpath
+
+Ton fastpath actuel :
+	•	recharge du contexte
+	•	passe par ResponseWriter
+	•	injecte un énorme bloc d’état
+	•	garde de la logique onboarding/discovery
+	•	peut escalader
+	•	continue de déclencher des side effects
+
+Donc ce n’est pas un fastpath.
+C’est un deuxième moteur conversationnel, déguisé en raccourci.
+
+Et c’est exactement pour ça que tu ressens ce côté “ça répond, mais ça sent cassé”.
+
+⸻
+
+3. chat.py est devenu trop central et trop impur
+
+Il gère à la fois :
+	•	idempotence
+	•	context loading
+	•	billing
+	•	trial feedback
+	•	onboarding
+	•	state resolving
+	•	gates
+	•	fastpath
+	•	orchestrator
+	•	seek_infos
+	•	executor
+	•	persistence assistant
+	•	postprocess webhooks
+	•	onboarding flags
+	•	task/custom hooks
+
+Donc aujourd’hui chat.py n’est plus un routeur.
+C’est un centre commercial.
+
+Le vrai souci n’est pas juste la longueur du fichier.
+Le vrai souci, c’est qu’il mélange :
+	•	des responsabilités de routing
+	•	des responsabilités métier
+	•	des side effects
+	•	des reliques d’anciens flows
+
+Et ça, ça détruit la lisibilité et la fiabilité.
+
+⸻
+
+4. handle_chat_message et handle_chat_message_stream ne sont pas suffisamment unifiés
+
+Tu as bien avancé côté stream, mais structurellement tu gardes encore deux pipelines logiques.
+
+Le plus grave
+
+seek_infos n’est pas géré pareil dans les deux modes :
+	•	en stream : vrai traitement + insert assistant
+	•	en non-stream : stub ou logique divergente
+
+Même si en front tu utilises surtout le stream, ça reste dangereux :
+	•	prod / dev peuvent diverger selon la route
+	•	un endpoint secondaire peut casser sans que tu le voies
+	•	tu gardes deux vérités possibles
+
+Donc tant qu’on n’a pas une seule fonction centrale de traitement, la dette reste là.
+
+⸻
+
+5. plan_executor.py transporte encore des restes de l’ancien monde
+
+Là aussi, très révélateur.
+
+Ce que je vois
+	•	sync_user_onboarding() appelé dans run
+	•	sync_user_onboarding() appelé aussi dans run_stream
+	•	logique onboarding encore branchée dans l’executor
+	•	import tool.onboarding_set_fields
+	•	import set_onboarding_fields
+	•	bloc onboarding sync “best effort” après exécution
+	•	coupling avec user_onboarding
+
+Donc même si tu nettoies chat.py, l’executor continue de réinjecter l’ancien flow.
+
+C’est important : le problème n’est pas localisé à un seul fichier.
+Le moteur est contaminé à plusieurs étages.
+
+⸻
+
+6. gates.py est presque vide… mais traîne encore le paywall
+
+Lui est simple :
+	•	il ne calcule plus que soft_paywall_warning
+
+Donc ce n’est pas le cœur du problème.
+
+Mais comme tu me dis que vous n’avez plus besoin du paywall dans le chat, il devient probablement inutile dans le flux principal.
+
+Conclusion :
+	•	ce n’est pas lui qui casse tout
+	•	mais il fait partie des choses à sortir du cœur du chat
+
+⸻
+
+7. ResponseWriter est trop chargé par des blocs hérités
+
+Le fichier lui-même n’est pas absurde techniquement.
+Mais il est devenu trop gouverné par des blocs historiques :
+	•	TRIAL_FEEDBACK_BLOCK
+	•	logique smalltalk_onboarding
+	•	smalltalk_questions_budget_max
+	•	aha_request=true
+	•	discovery_status
+	•	intro_smalltalk_turns
+	•	fastpath_directive_block
+	•	overlay state / brain / intent / docs / web / task / trial
+
+Donc Lisa écrit encore dans un cadre qui n’est plus le bon.
+
+Le problème n’est pas juste la taille du prompt
+
+Le vrai problème est qu’on mélange encore dans la même tête :
+	•	normal chat
+	•	onboarding
+	•	trial feedback
+	•	discovery
+	•	fastpath escalation
+	•	task execution
+	•	seek_infos
+
+Ça fait trop de rôles pour un seul rédacteur final.
+
+⸻
+
+Ce qui casse probablement la cohérence aujourd’hui
+
+Je te le mets brutalement, parce que là il faut être net.
+
+Cause racine n°1
+
+Le système continue de croire que le chat doit piloter l’onboarding.
+
+Cause racine n°2
+
+Le fastpath est utilisé comme un moteur conversationnel alternatif, alors qu’il devrait être un routeur minimal.
+
+Cause racine n°3
+
+Le chat principal est pollué par des side effects morts : onboarding sync, onboarding flags, trial feedback, discovery.
+
+Cause racine n°4
+
+seek_infos est encore traité comme une exception structurelle, pas comme une route standardisée.
+
+⸻
+
+Ma lecture de ton intuition “on refacto tout de suite”
+
+Je valide le fond.
+
+Mais je le reformule proprement :
+
+Oui, on refacto maintenant
+
+parce que l’architecture métier a changé
+
+et non parce que “le code est un peu moche”.
+
+La bonne cible n’est plus :
+	•	smalltalk onboarding
+	•	discovery capabilities
+	•	normal run
+
+La bonne cible est maintenant :
+	•	intro si historique vide
+	•	puis normal_run
+	•	et éventuellement seek_infos_active comme mode de route spécifique
+
+C’est beaucoup plus propre.
+
+⸻
+
+Architecture cible que je recommande
+
+États
+
+Je te recommande de ne garder que :
+	•	normal_run
+	•	seek_infos_active comme mode spécial interne, pas comme state conversationnel global si tu veux rester strict
+
+Et même si tu veux être encore plus radical :
+	•	state = normal_run tout le temps
+	•	seek_infos devient juste une route prioritaire détectée avant orchestration
+
+Franchement, c’est probablement le plus sain.
+
+⸻
+
+Routing cible
+
+Ordre logique
+	1.	charger message
+	2.	vérifier ownership / idempotence
+	3.	charger contexte minimal
+	4.	vérifier seek_infos actif
+	5.	si oui → route seek_infos
+	6.	sinon → route standard
+	7.	route standard = orchestrator normal
+	8.	plan executor
+	9.	persistence assistant
+	10.	postprocess hooks utiles seulement
+
+⸻
+
+Intro
+
+L’intro doit rester exclusivement :
+	•	côté endpoint intro
+	•	côté front si historique vide
+
+Aucune logique state discovery derrière.
+
+⸻
+
+Onboarding
+
+À sortir du moteur chat.
+
+Le chat ne doit plus :
+	•	démarrer onboarding
+	•	incrémenter onboarding
+	•	compléter onboarding
+	•	changer level_max
+	•	émettre aha_request
+	•	émettre aha_moment
+	•	émettre discovery_abort
+
+Terminé.
+
+⸻
+
+Trial / paywall
+
+À sortir du cœur du chat principal.
+
+On verra plus tard si tu veux un mécanisme commercial propre, mais certainement pas à l’intérieur du moteur conversationnel central pendant cette phase de remise à plat.
+
+⸻
+
+Seek_infos
+
+À conserver, mais à réintégrer proprement.
+
+Il faut qu’il devienne :
+	•	une détection prioritaire
+	•	une construction de contexte dédiée
+	•	un appel RW avec brain dédié si tu veux
+	•	mais dans le même squelette de traitement/persistence que le reste
+
+Pas un mini-système parallèle.
+
+⸻
+
+Ce que je supprimerais ou neutraliserais en priorité
+
+Dans chat.py
+	•	apply_onboarding_state(...)
+	•	_persist_onboarding_flags(...)
+	•	toute la logique trial feedback
+	•	tout ce qui dépend encore de state_resolver_v2 version ancienne
+	•	toute bifurcation fastpath onboarding/discovery
+
+Dans plan_executor.py
+	•	sync_user_onboarding(...)
+	•	logique onboarding sync finale
+	•	tool.onboarding_set_fields
+	•	set_onboarding_fields
+	•	tout ce qui reconnecte l’executor à un onboarding conversationnel
+
+Dans response_writer.py
+
+À court terme :
+	•	neutraliser les blocs liés à :
+	•	smalltalk_onboarding
+	•	aha_request
+	•	trial_feedback
+	•	discovery_status comme logique métier centrale
+
+Pas forcément tout supprimer d’un coup, mais au moins les sortir du flux principal.
+
+Dans state_resolver_v2.py
+	•	remplacer la logique actuelle par quelque chose de trivial
+	•	voire le retirer complètement du moteur principal
+
+⸻
+
+Ce qui est sain aujourd’hui et qu’on garde
+	•	chat/intro
+	•	ResponseWriterAgent comme rédacteur final
+	•	OrchestratorAgent
+	•	PlanExecutor
+	•	tool.docs_chunks
+	•	tool.web_search
+	•	task_execution_context
+	•	seek_infos comme besoin métier réel
+	•	userfacts et hooks métiers utiles, mais seulement après stabilisation
+
+⸻
+
+Les anomalies précises que j’ai relevées
+
+1. Double sync onboarding dans plan_executor.py
+
+Tu appelles sync_user_onboarding() :
+	•	une première fois
+	•	puis encore une deuxième fois plus bas
+
+Ça sent le patch empilé. À virer.
+
+2. _find_first_node_id() ultra fragile
+
+Il repose sur :
+	•	A, B, C, S, O, P
+
+Ça passe tant que ton plan respecte ces IDs, mais c’est fragile pour une architecture qui a déjà beaucoup muté.
+
+Ce n’est pas la priorité n°1, mais il faudra le reprendre.
+
+3. ResponseWriter.run_stream() bufferise les deltas en fastpath
+
+Donc même le fastpath stream n’est pas vraiment un vrai stream dans ce cas.
+
+Ce n’est pas forcément mauvais en soi, mais ça confirme que le fastpath est tordu structurellement.
+
+4. chat.py contient trop de logique copiée-collée
+
+Les deux handlers partagent beaucoup trop de blocs homologues avec variations.
+Ça favorise les divergences silencieuses.
+
+⸻
+
+Réponse à ta question stratégique
+
+Tu me demandais en gros :
+
+on inspecte encore tout ou on repart de zéro maintenant ?
+
+Ma réponse :
+
+On a assez vu pour lancer la remise à plat
+
+Pas besoin d’auditer 15 fichiers de plus.
+
+Le problème est déjà suffisamment clair.
+
+Donc maintenant, la bonne suite ce n’est plus l’audit pur.
+La bonne suite, c’est :
+
+Phase 1 — valider la cible
+
+ce qu’on vient de faire
+
+Phase 2 — refacto du squelette du chat
+
+sans toucher encore aux raffinements
+
+Phase 3 — réintégration propre de seek_infos
+
+Phase 4 — nettoyage du prompt / brains / task scopes
+
+seulement après
+
+⸻
+
+Le plan de refacto que je te propose
+
+Je te donne la vision globale. Ensuite on le fera pas à pas.
+
+Bloc 1 — Simplifier la mécanique d’état
+
+Objectif :
+	•	tuer smalltalk_onboarding
+	•	tuer discovery_capabilities
+	•	ne garder que le run normal du chat principal
+
+Bloc 2 — Débrancher onboarding/trial du chat principal
+
+Objectif :
+	•	plus aucun side effect onboarding dans chat.py
+	•	plus aucun sync onboarding dans plan_executor.py
+	•	plus aucun trial feedback dans le cœur de traitement
+
+Bloc 3 — Unifier la route standard
+
+Objectif :
+	•	un seul pipeline logique de traitement
+	•	stream et non-stream alignés
+
+Bloc 4 — Réintégrer seek_infos proprement
+
+Objectif :
+	•	garder la détection prioritaire
+	•	mais faire passer la réponse dans un contrat standardisé
+
+Bloc 5 — Re-nettoyer ResponseWriter
+
+Objectif :
+	•	enlever les vieux cadres mentaux
+	•	garder seulement les blocs encore cohérents avec le produit
+
+⸻
+
+Mon conseil immédiat
+
+On ne touche pas encore au front.
+
+Le front viendra après, si besoin.
+Là, la vraie panne est backend.
+
+Et on ne touche pas encore à l’orchestrator prompt.
+Le routing doit d’abord être remis droit.
+
+⸻
+
+Ce que je te propose maintenant
+
+On commence par Bloc 1, donc la remise à plat du squelette de routing.
+
+Et on le fait comme tu veux travailler :
+	•	une vision claire
+	•	puis étape par étape
+	•	sans balancer 15 modifs d’un coup
+
+Bloc 1 précis
+
+On va d’abord transformer la logique en ceci :
+	•	plus de smalltalk_onboarding
+	•	plus de discovery_capabilities
+	•	plus de apply_onboarding_state()
+	•	plus de _persist_onboarding_flags()
+	•	plus de trial feedback dans le flux principal
+	•	le chat principal route directement en normal_run
+	•	seule exception : seek_infos détecté en amont

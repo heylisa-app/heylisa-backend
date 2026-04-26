@@ -344,15 +344,9 @@ class ResponseWriterAgent:
         need_web: bool = False,
         mode: str = "normal",
         task_execution_context: Optional[Dict[str, Any]] = None,
-        smalltalk_target_key: Optional[str] = None,
-        transition_window: bool = False,
-        transition_reason: Optional[str] = None,
-        soft_paywall_warning: bool = False,
         intent_eligible: bool = True,
         intent_block_reason: Optional[str] = None,
-        trial_feedback_prompt_enabled: bool = False,
         context: Optional[Dict[str, Any]] = None,
-        quota: Optional[Dict[str, Any]] = None,
         web: Optional[Dict[str, Any]] = None,
         web_search: Optional[Dict[str, Any]] = None,
         route_source: str = "orchestrator",
@@ -360,10 +354,6 @@ class ResponseWriterAgent:
         docs_chunks: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         ctx = context or {}
-
-        history_msgs = ((ctx.get("history") or {}).get("messages") or [])
-        if not isinstance(history_msgs, list):
-            history_msgs = []
 
         ws = web if isinstance(web, dict) and web else (web_search or {})
 
@@ -376,9 +366,6 @@ class ResponseWriterAgent:
 
         preferences = _pick(ctx, "preferences", {}) or {}
         settings_ctx = _pick(ctx, "settings", {}) or {}
-        onboarding_state = _pick(ctx, "onboarding_state", {}) or {}
-        onboarding_ctx = _pick(ctx, "onboarding", {}) or {}
-        gates_ctx = _pick(ctx, "gates", {}) or {}
         user_ctx = _pick(ctx, "user", {}) or {}
         member_ctx = _pick(ctx, "member", {}) or {}
         cabinet_ctx = _pick(ctx, "cabinet", {}) or {}
@@ -413,32 +400,6 @@ class ResponseWriterAgent:
             user_first_name=_safe_str(user_ctx.get("first_name") or "") or None,
             user_last_name=_safe_str(user_ctx.get("last_name") or "") or None,
         )
-
-        discovery_status = _safe_str(
-            onboarding_state.get("discovery_status")
-            or settings_ctx.get("discovery_status")
-            or onboarding_ctx.get("discovery_status")
-            or "to_do"
-        ).strip().lower()
-
-        intro_smalltalk_turns = int(
-            onboarding_state.get("intro_smalltalk_turns")
-            or settings_ctx.get("intro_smalltalk_turns")
-            or onboarding_ctx.get("intro_smalltalk_turns")
-            or 0
-        )
-
-        # fallback défensif si la valeur n'est pas encore hydratée côté onboarding/settings
-        if intro_smalltalk_turns <= 0:
-            intro_smalltalk_turns = int(gates_ctx.get("user_messages_count") or 0)
-
-        smalltalk_questions_budget_max = 5
-        smalltalk_questions_asked = min(intro_smalltalk_turns, smalltalk_questions_budget_max)
-        smalltalk_questions_remaining = max(
-            0,
-            smalltalk_questions_budget_max - smalltalk_questions_asked,
-        )
-
 
         ws_ok = bool(_pick(ws, "ok", False))
         ws_answer = _pick(ws, "answer", "")
@@ -581,37 +542,17 @@ STYLE
 - sans dire “je vais essayer” si tu n’as pas la capacité confirmée
 """.strip()
 
-        state_keys = get_user_prompt_keys("state")
         intent_keys = get_user_prompt_keys("intent")
-        misc_keys = get_user_prompt_keys("misc")
-
-        if state_key and state_key not in state_keys:
-            state_key = ""
 
         if intent_key and intent_key not in intent_keys:
             intent_key = ""
 
-        state_vars: Dict[str, str] = {
-            "transition_window": ("true" if transition_window else "false"),
-            "transition_reason": (_safe_str(transition_reason)[:120] if transition_reason else "null"),
-            "discovery_status": (discovery_status or "to_do"),
-            "intro_smalltalk_turns": str(intro_smalltalk_turns),
-            "smalltalk_questions_budget_max": str(smalltalk_questions_budget_max),
-            "smalltalk_questions_asked": str(smalltalk_questions_asked),
-            "smalltalk_questions_remaining": str(smalltalk_questions_remaining),
-            "member_job_role": _safe_str(member_ctx.get("job_role") or "unknown"),
-            "member_role": _safe_str(member_ctx.get("role") or "unknown"),
-            "cabinet_name": _safe_str(cabinet_ctx.get("name") or "cabinet"),
-        }
+        state_block = ""
 
         intent_vars: Dict[str, str] = {
             "intent_eligible": ("true" if intent_eligible else "false"),
             "intent_block_reason": (_safe_str(intent_block_reason)[:120] if intent_block_reason else "null"),
         }
-
-        state_block = ""
-        if state_key:
-            state_block = load_user_prompt_block(kind="state", key=state_key, vars=state_vars).strip()
 
         primary_brain_candidate = _normalize_key(primary_brain_key or intent_key)
         secondary_brain_candidate = _normalize_key(secondary_brain_key)
@@ -672,15 +613,6 @@ RÈGLES D’USAGE
 - Tu t’en sers comme mémoire active légère.
 """.strip()
 
-        trial_feedback_block = ""
-        trial_already_covered_by_brain = (
-            (primary_brain_resolved_key in {"trial_feedback", "trial_feedback_light"})
-            or (secondary_brain_resolved_key in {"trial_feedback", "trial_feedback_light"})
-        )
-
-        if trial_feedback_prompt_enabled and not trial_already_covered_by_brain:
-            trial_feedback_block = TRIAL_FEEDBACK_BLOCK
-
         raw_msg = (raw_user_message or user_message or "").strip()
 
         def _word_count(txt: str) -> int:
@@ -704,60 +636,6 @@ RÈGLES STRICTES :
 - Si ambigu, pose une seule question courte de clarification.
 """.strip()
 
-        smalltalk_runtime_block = ""
-        if state_key == "smalltalk_onboarding":
-            if smalltalk_questions_remaining > 0:
-                smalltalk_runtime_block = f"""
-PILOTAGE CONVERSATIONNEL — ONBOARDING EN COURS
-
-Tu es dans la phase de cadrage initial du cabinet.
-
-Budget de questions de cadrage :
-- maximum total : {smalltalk_questions_budget_max}
-- déjà utilisées : {smalltalk_questions_asked}
-- restantes : {smalltalk_questions_remaining}
-
-RÈGLES DU MOMENT
-- Tu ne fais jamais un interrogatoire.
-- Tu poses au maximum UNE seule vraie question utile dans ce message.
-- Tu exploites d’abord ce que l’utilisateur vient déjà de donner.
-- Tu évites toute formule mécanique du type :
-  “pour mieux comprendre”, “pour mieux cerner”, “pour mieux aider”, “pour clarifier”.
-- Tu parles comme une assistante humaine incarnée, pas comme un questionnaire.
-
-OBJECTIF PRIORITAIRE
-- soit faire avancer le cadrage avec une seule question très ciblée,
-- soit, si la matière est déjà suffisante, proposer naturellement comment tu peux aider concrètement dans SON contexte.
-
-IMPORTANT
-- Ne parle jamais de “démo”.
-- Ne parle jamais de “Lisa” à la troisième personne.
-- Tu parles en ton nom : “je peux t’aider…”, “je peux te montrer comment je peux aider…”
-""".strip()
-            else:
-                smalltalk_runtime_block = f"""
-PILOTAGE CONVERSATIONNEL — BASCULE OBLIGATOIRE
-
-Tu es à la fin de la phase de cadrage initial du cabinet.
-
-Budget de questions de cadrage :
-- maximum total : {smalltalk_questions_budget_max}
-- déjà utilisées : {smalltalk_questions_asked}
-- restantes : 0
-
-RÈGLES DU MOMENT
-- Tu ne poses PLUS de nouvelle question de cadrage.
-- Tu ne relances PAS l’exploration.
-- Tu t’appuies sur la matière déjà collectée.
-- Tu proposes maintenant, naturellement, de montrer comment tu peux aider concrètement dans le contexte du cabinet.
-
-IMPORTANT
-- Ne parle jamais de “démo”.
-- Ne parle jamais de “Lisa” à la troisième personne.
-- Tu parles en ton nom.
-- Si tu proposes cette bascule, tu termines ton message par :
-aha_request=true
-""".strip()
 
         fastpath_directive_block = ""
         if is_fastpath:
@@ -818,7 +696,6 @@ MESSAGE UTILISATEUR:
 
 {thread_alert_block}
 
-{smalltalk_runtime_block}
 
 PARAMÈTRES
 - language: {language}
@@ -831,8 +708,6 @@ CONTEXTE MÉTIER COURT
 - cabinet_name: {_safe_str(cabinet_ctx.get("name") or "cabinet")}
 - member_job_role: {_safe_str(member_ctx.get("job_role") or "unknown")}
 - member_role: {_safe_str(member_ctx.get("role") or "unknown")}
-- discovery_status: {discovery_status}
-- intro_smalltalk_turns: {intro_smalltalk_turns}
 
 DOCS_CHUNKS
 - ok: {dc_ok}
@@ -870,7 +745,6 @@ INSTRUCTIONS DE RÉPONSE
 
 {task_execution_block}
 
-{trial_feedback_block}
 
 """.strip()
 
@@ -905,8 +779,6 @@ INSTRUCTIONS DE RÉPONSE
             secondary_brain_kind=secondary_brain_resolved_kind or "null",
             fastpath_directive_len=len(fastpath_directive_block or ""),
             fastpath_directive_enabled=bool(fastpath_directive_block),
-            trial_feedback_block_len=len(trial_feedback_block or ""),
-            trial_feedback_prompt_enabled=bool(trial_feedback_prompt_enabled),
             is_fastpath=is_fastpath,
             route_source=route_source,
             runtime_state=runtime_state_in or "null",
@@ -939,15 +811,9 @@ INSTRUCTIONS DE RÉPONSE
         meta_debug = {
             "ws_ok": ws_ok,
             "dc_ok": dc_ok,
-            "intro_smalltalk_turns": intro_smalltalk_turns,
-            "smalltalk_questions_budget_max": smalltalk_questions_budget_max,
-            "smalltalk_questions_asked": smalltalk_questions_asked,
-            "smalltalk_questions_remaining": smalltalk_questions_remaining,
-            "trial_feedback_prompt_enabled": bool(trial_feedback_prompt_enabled),
             "docs_present": docs_present,
             "is_fastpath": is_fastpath,
             "runtime_state": runtime_state_in,
-            "discovery_status": discovery_status,
             "primary_brain_key": primary_brain_resolved_key or primary_brain_candidate,
             "primary_brain_kind": primary_brain_resolved_kind,
             "secondary_brain_key": secondary_brain_resolved_key or secondary_brain_candidate,
@@ -1021,15 +887,9 @@ INSTRUCTIONS DE RÉPONSE
             need_web=need_web,
             mode=mode,
             task_execution_context=task_execution_context,
-            smalltalk_target_key=smalltalk_target_key,
-            transition_window=transition_window,
-            transition_reason=transition_reason,
-            soft_paywall_warning=soft_paywall_warning,
             intent_eligible=intent_eligible,
             intent_block_reason=intent_block_reason,
-            trial_feedback_prompt_enabled=trial_feedback_prompt_enabled,
             context=context,
-            quota=quota,
             web=web,
             web_search=web_search,
             route_source=route_source,
@@ -1215,15 +1075,9 @@ INSTRUCTIONS DE RÉPONSE
             need_web=need_web,
             mode=mode,
             task_execution_context=task_execution_context,
-            smalltalk_target_key=smalltalk_target_key,
-            transition_window=transition_window,
-            transition_reason=transition_reason,
-            soft_paywall_warning=soft_paywall_warning,
             intent_eligible=intent_eligible,
             intent_block_reason=intent_block_reason,
-            trial_feedback_prompt_enabled=trial_feedback_prompt_enabled,
             context=context,
-            quota=quota,
             web=web,
             web_search=web_search,
             route_source=route_source,
